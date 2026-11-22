@@ -1,0 +1,599 @@
+import { useState, useEffect } from "react";
+import { NavLink, Outlet, useNavigate, useLocation } from "react-router-dom";
+import { useAuth } from "../../context/AuthContext";
+import { ScheduleProvider, useScheduleContext } from "../../context/ScheduleContext";
+import { NotificationsProvider, useNotifications } from "../../context/NotificationsContext";
+import { RequestsProvider } from "../../context/RequestsContext";
+import { TemplatesProvider, useTemplates } from "../../context/TemplatesContext";
+import { SettingsProvider } from "../../context/SettingsContext";
+import { RippleButton } from "../RippleButton";
+import { AppBackdrop } from "../AppBackdrop";
+import { ApplyTemplateCalendarModal } from "../ApplyTemplateCalendarModal";
+import { GenerateTemplateModal } from "../GenerateTemplateModal";
+import { WEEK_DAY_NAMES } from "../../utils/scheduleUtils";
+import { LoaderCircleIcon } from "../LoaderCircleIcon";
+
+const managerNav = [
+  { to: "/",               label: "Daily Schedule" },
+  { to: "/weekly",         label: "Weekly Schedule" },
+  { to: "/calendar",       label: "Events by Month" },
+  { to: "/templates",      label: "Templates" },
+  { to: "/add-event",      label: "Add Event" },
+  { to: "/manage-staff",       label: "Manage Staff" },
+  { to: "/notifications",      label: "Notifications" },
+];
+
+const employeeNav = [
+  { to: "/my-schedule",       label: "My Schedule" },
+  { to: "/team-schedule",     label: "Weekly Schedule" },
+  { to: "/calendar",          label: "Events by Month" },
+  { to: "/shift-requests",    label: "Shift Requests" },
+  { to: "/request-time-off",  label: "Drop Shift" },
+  { to: "/availability",      label: "Availability" },
+  { to: "/notifications",     label: "Notifications" },
+];
+
+function IconMenu() {
+  return (
+    <svg width="18" height="14" viewBox="0 0 18 14" fill="none" aria-hidden="true">
+      <rect x="0" y="0"  width="18" height="2" rx="1" fill="currentColor"/>
+      <rect x="0" y="6"  width="18" height="2" rx="1" fill="currentColor"/>
+      <rect x="0" y="12" width="18" height="2" rx="1" fill="currentColor"/>
+    </svg>
+  );
+}
+
+function IconClose() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+      <path d="M1 1l12 12M13 1L1 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+    </svg>
+  );
+}
+
+function IconBell() {
+  return (
+    <svg width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true">
+      <path d="M8.5 1.5A4.5 4.5 0 004 6v3.5L2.5 12h12L13 9.5V6A4.5 4.5 0 008.5 1.5z"
+        stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"/>
+      <path d="M7 13.5a1.5 1.5 0 003 0" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+    </svg>
+  );
+}
+
+function AppLayoutInner() {
+  const { user, logout } = useAuth();
+  const navigate          = useNavigate();
+  const location          = useLocation();
+  const navItems          = user?.role === "manager" ? managerNav : employeeNav;
+  const [now, setNow]     = useState(new Date());
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const { unreadCount }   = useNotifications();
+  const { templates, selectedId, setSelectedId, requestSelect, addTemplate, removeAllTemplates } = useTemplates();
+  const { staff, saveDaySchedule, weeklyViewLoading, setWeeklyViewLoading, teamScheduleLoading, setTeamScheduleLoading } = useScheduleContext();
+  const isTemplates = location.pathname === '/templates';
+  const [applyTplOpen, setApplyTplOpen] = useState(false);
+  const [generateOpen, setGenerateOpen] = useState(false);
+
+  // Build a weekly template from submitted availability, then open it in the
+  // editor so the manager can adjust before it's used.
+  async function handleGenerateTemplate({ name, days }) {
+    const created = await addTemplate({
+      type: 'week',
+      name,
+      description: 'Auto-generated from submitted availability',
+      days,
+    });
+    setSelectedId(created.id);
+    setGenerateOpen(false);
+    navigate('/templates');
+  }
+
+  // New-template modal state. Both kinds go through the same named form: a
+  // weekly template used to be created straight from the picker with no name at
+  // all, which the server rejected outright (`name` is required), so the button
+  // silently did nothing. Asking for the name first is what the day branch
+  // already did, and it also stops an abandoned click leaving an empty row.
+  const [newTplStep, setNewTplStep] = useState(null);   // null | 'pick' | 'form'
+  const [newTplKind, setNewTplKind] = useState('day');  // 'day' | 'week'
+  const [tplName,    setTplName]    = useState('');
+  const [tplDesc,    setTplDesc]    = useState('');
+  const [tplError,   setTplError]   = useState('');
+
+  function openNewTpl() { setTplName(''); setTplDesc(''); setTplError(''); setNewTplStep('pick'); }
+  function closeNewTpl() { setNewTplStep(null); }
+  function pickKind(kind) { setNewTplKind(kind); setTplError(''); setNewTplStep('form'); }
+
+  async function createTemplate() {
+    const trimmed = tplName.trim();
+    if (!trimmed) { setTplError('Name is required.'); return; }
+    // A duplicate name isn't rejected — addTemplate numbers the copy.
+    const shape = newTplKind === 'day'
+      ? { type: 'day', staff: [] }
+      // All seven days, matching the other creation paths — see WEEK_DAY_NAMES.
+      : { type: 'week', days: Object.fromEntries(WEEK_DAY_NAMES.map(d => [d, { staff: [] }])) };
+    try {
+      const created = await addTemplate({ ...shape, name: trimmed, description: tplDesc.trim() });
+      setSelectedId(created.id);
+      closeNewTpl();
+      navigate('/templates');
+    } catch (err) {
+      setTplError(err.message || 'Failed to create template.');
+    }
+  }
+
+  // Live clock
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Close drawer on route change
+  useEffect(() => { setDrawerOpen(false); }, [location.pathname]);
+
+  // Close drawer when viewport widens to desktop
+  useEffect(() => {
+    function onResize() { if (window.innerWidth >= 1024) setDrawerOpen(false); }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // Close drawer on Escape
+  useEffect(() => {
+    function onKey(e) { if (e.key === "Escape") setDrawerOpen(false); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  function handleLogout() {
+    logout();
+    navigate("/login");
+  }
+
+  const navLinks = navItems.map(({ to, label }) => (
+    <NavLink
+      key={to}
+      to={to}
+      end={to === "/"}
+      onClick={() => {
+        if (to === "/weekly" && location.pathname !== "/weekly") setWeeklyViewLoading(true);
+        if (to === "/team-schedule" && location.pathname !== "/team-schedule") setTeamScheduleLoading(true);
+      }}
+      className="relative py-2 px-3 rounded text-sm font-medium transition-colors hover:opacity-90"
+      style={({ isActive }) => ({
+        background:  isActive ? "rgba(176, 80, 48, 0.1)" : "transparent",
+        color:       isActive ? "var(--color-text)" : "var(--color-text-dim)",
+      })}
+    >
+      {label}
+      {to === "/notifications" && unreadCount > 0 && (
+        <span
+          className="absolute top-1/2 -translate-y-1/2 right-2 min-w-[16px] h-4 flex items-center justify-center rounded-full text-[10px] font-bold px-1"
+          style={{ background: "#c84040", color: "white", lineHeight: 1 }}
+        >
+          {unreadCount > 99 ? "99+" : unreadCount}
+        </span>
+      )}
+      {to === "/weekly" && weeklyViewLoading && (
+        <span className="absolute top-1/2 -translate-y-1/2 right-2 flex items-center">
+          <LoaderCircleIcon size={14} style={{ color: "var(--color-text-dim)" }} />
+        </span>
+      )}
+      {to === "/team-schedule" && teamScheduleLoading && (
+        <span className="absolute top-1/2 -translate-y-1/2 right-2 flex items-center">
+          <LoaderCircleIcon size={14} style={{ color: "var(--color-text-dim)" }} />
+        </span>
+      )}
+    </NavLink>
+  ));
+
+  const userCard = (
+    <div className="mt-4 p-3 rounded-lg border" style={{ borderColor: "var(--color-border)" }}>
+      <div className="text-xs font-medium text-center" style={{ color: "var(--color-text)" }}>
+        {user?.name}
+      </div>
+      <div className="flex gap-2 mt-2">
+        <button
+          onClick={handleLogout}
+          className="ripple-btn flex-1 text-xs py-1.5 rounded"
+          // Much smaller button than Sign In, so the circle only needs to cover
+          // a short pill — the 16em default would fill it almost instantly and
+          // lose the sweep.
+          style={{ "--ripple-size": "7em" }}
+        >
+          <span className="ripple-transition" />
+          <span className="ripple-gradient" />
+          <span className="ripple-label">Log out</span>
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    // No background of its own: an opaque one here would cover the dithered
+    // backdrop below, which paints at z-index -1. `body` still carries
+    // --color-bg (index.css), so the flat colour remains the fallback whenever
+    // the backdrop doesn't render — no WebGL, or its chunk still loading.
+    <div className="flex min-h-screen" style={{ color: "var(--color-text)" }}>
+
+      {/* Dithered wave behind everything. Only the gaps between the opaque
+          surface cards show it; nothing above becomes transparent. */}
+      <AppBackdrop />
+
+      {/* Mobile backdrop */}
+      {drawerOpen && (
+        <div
+          className="fixed inset-0 z-40 lg:hidden"
+          style={{ background: "rgba(0,0,0,0.55)" }}
+          onClick={() => setDrawerOpen(false)}
+        />
+      )}
+
+      {/* Sidebar (desktop static) / Drawer (mobile fixed) */}
+      <aside
+        className={[
+          "fixed lg:static inset-y-0 left-0",
+          "w-64 lg:w-52 shrink-0",
+          "flex flex-col gap-1 p-4 border-r",
+          "z-50 lg:z-auto",
+          "overflow-y-auto",
+          "transition-transform duration-200 ease-in-out",
+          drawerOpen ? "translate-x-0" : "-translate-x-full",
+          "lg:translate-x-0",
+        ].join(" ")}
+        // Deliberately opaque, unlike the content cards: the nav is the one
+        // surface that's on screen on every page, so it stays a solid edge for
+        // the page to sit against rather than another thing to see through.
+        style={{ background: "var(--color-surface)", borderColor: "var(--color-border)" }}
+      >
+        {/* Mobile drawer header */}
+        <div className="flex items-center justify-between mb-2 lg:hidden">
+          <span className="text-xs uppercase tracking-widest font-medium" style={{ color: "var(--color-text-dim)" }}>
+            Menu
+          </span>
+          <button
+            onClick={() => setDrawerOpen(false)}
+            className="p-1.5 rounded cursor-pointer hover:opacity-80"
+            style={{ background: "var(--color-muted)", color: "var(--color-text)", border: "none" }}
+          >
+            <IconClose />
+          </button>
+        </div>
+
+        {/* Brand */}
+        <button
+          onClick={() => navigate(user?.role === "manager" ? "/" : "/my-schedule")}
+          className="mb-3 px-2 text-left w-full cursor-pointer hover:opacity-80 transition-opacity"
+          style={{ background: "none", border: "none" }}
+        >
+          <h1 className="text-lg font-bold" style={{ color: "var(--color-text)" }}>CATalyst studios</h1>
+          <p className="text-xs mt-0.5" style={{ color: "var(--color-text-dim)" }}>Scheduling Management</p>
+          <p className="text-xs mt-1.5 font-mono tabular-nums" style={{ color: "var(--color-today)" }}>
+            {now.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", second: "2-digit" })}
+          </p>
+          <p className="text-xs mt-0.5" style={{ color: "var(--color-text-dim)" }}>
+            {now.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}
+          </p>
+        </button>
+
+        <div className="mb-3" style={{ borderBottom: "1px solid var(--color-border)" }} />
+
+        {navLinks}
+
+        <div className="flex-1" />
+
+        {userCard}
+      </aside>
+
+      {/* Templates secondary panel — desktop only, shown when on /templates */}
+      {isTemplates && (
+        <div
+          className="hidden lg:flex flex-col shrink-0 overflow-y-auto"
+          style={{
+            // Template names and descriptions are single-line with an ellipsis,
+            // so this width is how much of each you get to read.
+            width: 260,
+            borderRight: '1px solid var(--color-border)',
+            // Opaque for the same reason as the nav beside it — the two left
+            // columns read as one solid edge.
+            background: 'var(--color-surface)',
+            padding: '12px 10px',
+            gap: 6,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4, paddingLeft: 4 }}>
+            <span style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--color-text-dim)' }}>
+              Templates
+            </span>
+          </div>
+
+          <RippleButton
+            onClick={openNewTpl}
+            rippleSize="18em"
+            style={{ width: '100%', padding: '7px 10px', borderRadius: 8, fontWeight: 600, fontSize: 13, marginBottom: 4 }}
+          >
+            ＋ New Template
+          </RippleButton>
+
+          <RippleButton
+            onClick={() => setGenerateOpen(true)}
+            rippleSize="18em"
+            style={{ width: '100%', padding: '7px 10px', borderRadius: 8, fontWeight: 600, fontSize: 12, marginBottom: 4, lineHeight: 1.3 }}
+          >
+            ＋ Auto-Generate from Availability
+          </RippleButton>
+
+          <RippleButton
+            onClick={() => setApplyTplOpen(true)}
+            tone="green"
+            rippleSize="18em"
+            style={{ width: '100%', padding: '7px 10px', borderRadius: 8, fontWeight: 600, fontSize: 12, marginBottom: 4, lineHeight: 1.3 }}
+          >
+            Apply a Template
+          </RippleButton>
+
+          {(() => {
+            const weeklyTpls = templates.filter(t => !t.type || t.type === 'week');
+            const dayTpls    = templates.filter(t => t.type === 'day');
+            const renderCard = (tpl) => {
+              const isSelected = tpl.id === selectedId;
+              return (
+                <div
+                  key={tpl.id}
+                  onClick={() => requestSelect(tpl.id)}
+                  style={{
+                    padding: '8px 10px', borderRadius: 8, cursor: 'pointer',
+                    background: isSelected ? 'rgba(176,80,48,0.08)' : 'rgba(77,182,172,0.08)',
+                    transition: 'background 0.12s',
+                  }}
+                  onMouseEnter={e => { if (!isSelected) e.currentTarget.style.background = 'rgba(77,182,172,0.16)'; }}
+                  onMouseLeave={e => { if (!isSelected) e.currentTarget.style.background = 'rgba(77,182,172,0.08)'; }}
+                >
+                  <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {tpl.name || <em style={{ color: 'var(--color-text-dim)', fontWeight: 400 }}>Untitled</em>}
+                  </div>
+                  {tpl.type === 'day' && (
+                    <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-accent)', marginTop: 2, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                      Day
+                    </div>
+                  )}
+                  {tpl.description && (
+                    <div style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {tpl.description}
+                    </div>
+                  )}
+                </div>
+              );
+            };
+            if (weeklyTpls.length === 0 && dayTpls.length === 0) return (
+              <div style={{ fontSize: 12, color: 'var(--color-text-dim)', textAlign: 'center', padding: '12px 4px' }}>
+                No templates yet.
+              </div>
+            );
+            return (
+              <>
+                {weeklyTpls.length > 0 && (
+                  <>
+                    <div style={{ fontSize: 12, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'white', textAlign: 'center', marginTop: 4, marginBottom: 2 }}>Week</div>
+                    {weeklyTpls.map(renderCard)}
+                  </>
+                )}
+                {dayTpls.length > 0 && (
+                  <>
+                    {weeklyTpls.length > 0 && <div style={{ height: 1, background: 'var(--color-accent)', opacity: 0.4, margin: '8px 4px' }} />}
+                    <div style={{ fontSize: 12, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'white', textAlign: 'center', marginBottom: 2 }}>Day</div>
+                    {dayTpls.map(renderCard)}
+                  </>
+                )}
+              </>
+            );
+          })()}
+
+          <div style={{ flex: 1 }} />
+
+          <RippleButton
+            onClick={async () => {
+              if (window.confirm('Delete all templates? This cannot be undone.')) {
+                try {
+                  await removeAllTemplates();
+                } catch (err) {
+                  window.alert(err.message || 'Failed to delete templates.');
+                }
+                setSelectedId(null);
+              }
+            }}
+            tone="red"
+            rippleSize="18em"
+            style={{ width: '100%', padding: '7px 10px', borderRadius: 8, fontWeight: 600, fontSize: 12, marginTop: 8 }}
+          >
+            Delete All Templates
+          </RippleButton>
+        </div>
+      )}
+
+      {applyTplOpen && (
+        <ApplyTemplateCalendarModal
+          templates={templates}
+          allStaff={staff}
+          saveDaySchedule={saveDaySchedule}
+          onClose={() => setApplyTplOpen(false)}
+        />
+      )}
+
+      {generateOpen && (
+        <GenerateTemplateModal
+          staff={staff}
+          onCreate={handleGenerateTemplate}
+          onClose={() => setGenerateOpen(false)}
+        />
+      )}
+
+      {/* Right side: top bar + content */}
+      <div className="flex flex-col flex-1 min-w-0">
+
+        {/* Mobile top bar */}
+        <header
+          className="lg:hidden sticky top-0 z-30 flex items-center justify-between px-4 py-3 border-b glass-surface"
+          style={{ borderColor: "var(--color-border)" }}
+        >
+          <button
+            onClick={() => setDrawerOpen(true)}
+            className="p-2 rounded-lg cursor-pointer hover:opacity-80 flex items-center justify-center"
+            style={{ background: "var(--color-muted)", color: "var(--color-text)", border: "none", width: 36, height: 36 }}
+            aria-label="Open menu"
+          >
+            <IconMenu />
+          </button>
+
+          <span className="text-sm font-bold tracking-tight" style={{ color: "var(--color-text)" }}>
+            CATalyst studios
+          </span>
+
+          <button
+            onClick={() => navigate("/notifications")}
+            className="relative p-2 rounded-lg cursor-pointer hover:opacity-80 flex items-center justify-center"
+            style={{ background: "var(--color-muted)", color: "var(--color-text)", border: "none", width: 36, height: 36 }}
+            aria-label="Notifications"
+          >
+            <IconBell />
+            {unreadCount > 0 && (
+              <span
+                className="absolute flex items-center justify-center rounded-full font-bold"
+                style={{
+                  top: 4, right: 4,
+                  minWidth: 14, height: 14,
+                  fontSize: 9,
+                  background: "#c84040",
+                  color: "white",
+                  padding: "0 3px",
+                  lineHeight: 1,
+                }}
+              >
+                {unreadCount > 9 ? "9+" : unreadCount}
+              </span>
+            )}
+          </button>
+        </header>
+
+        {/* Page content */}
+        <main className="flex-1 overflow-auto p-3 sm:p-4 lg:p-6">
+          <Outlet />
+        </main>
+      </div>
+
+      {/* New template modal */}
+      {newTplStep && (
+        <div
+          style={{ position: 'fixed', inset: 0, zIndex: 1100, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.55)' }}
+          onClick={e => { if (e.target === e.currentTarget) closeNewTpl(); }}
+        >
+          <div style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)', borderRadius: 14, padding: 28, width: 380, boxShadow: '0 8px 32px rgba(0,0,0,0.45)' }}>
+
+            {newTplStep === 'pick' && (
+              <>
+                <h3 style={{ margin: '0 0 6px', fontSize: 16, fontWeight: 700, color: 'var(--color-text)' }}>New Template</h3>
+                <p style={{ margin: '0 0 20px', fontSize: 13, color: 'var(--color-text-dim)' }}>What kind of template do you want to create?</p>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  <button
+                    onClick={() => pickKind('week')}
+                    style={{
+                      padding: '14px 16px', borderRadius: 10, border: '1px solid var(--color-border)',
+                      background: 'var(--color-muted)', cursor: 'pointer', textAlign: 'left',
+                    }}
+                    onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--color-accent)'}
+                    onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--color-border)'}
+                  >
+                    <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--color-text)', marginBottom: 3 }}>Weekly Template</div>
+                    <div style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>A full week of schedules — one staff layout per day (Mon–Sun)</div>
+                  </button>
+                  <button
+                    onClick={() => pickKind('day')}
+                    style={{
+                      padding: '14px 16px', borderRadius: 10, border: '1px solid var(--color-border)',
+                      background: 'var(--color-muted)', cursor: 'pointer', textAlign: 'left',
+                    }}
+                    onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--color-accent)'}
+                    onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--color-border)'}
+                  >
+                    <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--color-text)', marginBottom: 3 }}>Day Template</div>
+                    <div style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>A single-day schedule you can apply to any specific date</div>
+                  </button>
+                </div>
+                <div style={{ marginTop: 16, textAlign: 'right' }}>
+                  <button onClick={closeNewTpl} style={{ padding: '7px 14px', borderRadius: 8, border: '1px solid var(--color-border)', background: 'transparent', color: 'var(--color-text-dim)', fontSize: 13, cursor: 'pointer' }}>
+                    Cancel
+                  </button>
+                </div>
+              </>
+            )}
+
+            {newTplStep === 'form' && (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+                  <button onClick={() => setNewTplStep('pick')} style={{ background: 'none', border: 'none', color: 'var(--color-text-dim)', cursor: 'pointer', fontSize: 18, padding: 0, lineHeight: 1 }}>←</button>
+                  <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--color-text)' }}>{newTplKind === 'week' ? 'New Weekly Template' : 'New Day Template'}</h3>
+                </div>
+
+                <div style={{ marginBottom: 12 }}>
+                  <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--color-text-dim)', marginBottom: 5 }}>Template Name *</label>
+                  <input
+                    autoFocus
+                    value={tplName}
+                    onChange={e => { setTplName(e.target.value); setTplError(''); }}
+                    onKeyDown={e => e.key === 'Enter' && createTemplate()}
+                    placeholder="e.g. Busy Day"
+                    style={{
+                      width: '100%', padding: '8px 10px', borderRadius: 7, fontSize: 13, boxSizing: 'border-box',
+                      background: 'var(--color-muted)', border: `1px solid ${tplError ? 'var(--color-red)' : 'var(--color-border)'}`,
+                      color: 'var(--color-text)', outline: 'none',
+                    }}
+                  />
+                  {tplError && <div style={{ fontSize: 11, color: 'var(--color-red)', marginTop: 4 }}>{tplError}</div>}
+                </div>
+
+                <div style={{ marginBottom: 20 }}>
+                  <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--color-text-dim)', marginBottom: 5 }}>Description (optional)</label>
+                  <input
+                    value={tplDesc}
+                    onChange={e => setTplDesc(e.target.value)}
+                    placeholder="Optional notes"
+                    style={{
+                      width: '100%', padding: '8px 10px', borderRadius: 7, fontSize: 13, boxSizing: 'border-box',
+                      background: 'var(--color-muted)', border: '1px solid var(--color-border)',
+                      color: 'var(--color-text)', outline: 'none',
+                    }}
+                  />
+                </div>
+
+                <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+                  <button onClick={closeNewTpl} style={{ padding: '7px 14px', borderRadius: 8, border: '1px solid var(--color-border)', background: 'transparent', color: 'var(--color-text-dim)', fontSize: 13, cursor: 'pointer' }}>
+                    Cancel
+                  </button>
+                  <button onClick={createTemplate} style={{ padding: '7px 16px', borderRadius: 8, border: 'none', background: 'var(--color-button)', color: 'var(--color-button-text)', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
+                    Create Day Template
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function AppLayout() {
+  return (
+    <SettingsProvider>
+      <ScheduleProvider>
+        <NotificationsProvider>
+          <RequestsProvider>
+            <TemplatesProvider>
+              <AppLayoutInner />
+            </TemplatesProvider>
+          </RequestsProvider>
+        </NotificationsProvider>
+      </ScheduleProvider>
+    </SettingsProvider>
+  );
+}

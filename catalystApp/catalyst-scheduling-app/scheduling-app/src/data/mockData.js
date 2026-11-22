@@ -1,0 +1,327 @@
+// ── Time constants ────────────────────────────────────────────────────────────
+export const HOURS_START = 7;
+export const HOURS_END = 20;
+
+// ── Studio hours ──────────────────────────────────────────────────────────────
+export const studioHours = { open: 8, close: 18 };
+
+// ── Desk coverage hours ───────────────────────────────────────────────────────
+// The front desk only needs manning during these windows — which is narrower
+// than the hours staff are in the building, so shifts outside them need no desk
+// cover at all. Keyed by JS day-of-week (0 = Sunday); null means no desk needed.
+//
+// Friday's 5:45 PM close doesn't land on the 30-minute grid the editor snaps to.
+// Coverage is therefore treated as overlapping rather than contained, so the
+// 5:30–6:00 slot still gets someone: a 15-minute desk shift can't be expressed,
+// and rounding down would leave the desk unmanned for the last 15 minutes.
+export const deskHoursByDay = {
+  0: { start: 13, end: 18 },    // Sunday     1:00–6:00 PM
+  1: { start: 9,  end: 18 },    // Monday     9:00 AM–6:00 PM
+  2: { start: 9,  end: 18 },    // Tuesday
+  3: { start: 9,  end: 18 },    // Wednesday
+  4: { start: 9,  end: 18 },    // Thursday
+  5: { start: 9,  end: 17.75 }, // Friday     9:00 AM–5:45 PM
+  6: null,                      // Saturday — studio closed
+};
+
+// ── VR studio coverage hours ──────────────────────────────────────────────────
+// The VR studio is staffed the same hours as the front desk. Kept as its own
+// object rather than an alias so the two can diverge without touching any of the
+// code that reads them — every VR helper goes through this, exactly as the desk
+// helpers go through deskHoursByDay.
+//
+// Friday's off-grid 5:45 PM close is handled the same way (see above): coverage
+// is treated as overlapping rather than contained, so the last slot is staffed.
+export const vrHoursByDay = {
+  0: { start: 13, end: 18 },    // Sunday     1:00–6:00 PM
+  1: { start: 9,  end: 18 },    // Monday     9:00 AM–6:00 PM
+  2: { start: 9,  end: 18 },    // Tuesday
+  3: { start: 9,  end: 18 },    // Wednesday
+  4: { start: 9,  end: 18 },    // Thursday
+  5: { start: 9,  end: 17.75 }, // Friday     9:00 AM–5:45 PM
+  6: null,                      // Saturday — studio closed
+};
+
+// ── Event types ───────────────────────────────────────────────────────────────
+// Single source of truth — this list was previously copy-pasted into four pages
+// and had drifted, so an event could be created with a type the edit dialogs
+// couldn't offer back.
+export const EVENT_TYPES = ['program', 'certification', 'meeting', 'workshop', 'other'];
+
+// ── Staff ─────────────────────────────────────────────────────────────────────
+export const initialStaff = [
+  { id: 1,  name: 'Alex C.',      shiftStart: 7.5,  shiftEnd: 12.5, deskStart: 8.5,  deskEnd: 9.5,  maxHoursPerWeek: 30 },
+  { id: 2,  name: 'Anika S.',     shiftStart: 7.5,  shiftEnd: 12.5, deskStart: null, deskEnd: null, maxHoursPerWeek: 20 },
+  { id: 3,  name: 'Elise R.',     shiftStart: 8,    shiftEnd: 13,   deskStart: 9,    deskEnd: 10,   maxHoursPerWeek: 30 },
+  { id: 4,  name: 'Heather M.',   shiftStart: 9,    shiftEnd: 14,   deskStart: null, deskEnd: null, maxHoursPerWeek: 30 },
+  { id: 5,  name: 'Helena H.',    shiftStart: 9,    shiftEnd: 14,   deskStart: 10,   deskEnd: 11,   maxHoursPerWeek: 15 },
+  { id: 6,  name: 'Izak M.',      shiftStart: 10,   shiftEnd: 15,   deskStart: null, deskEnd: null, maxHoursPerWeek: 30 },
+  { id: 7,  name: 'Jesus Q.',     shiftStart: 10,   shiftEnd: 15,   deskStart: 11,   deskEnd: 12,   maxHoursPerWeek: 20 },
+  { id: 8,  name: 'Jo L.',        shiftStart: 10.5, shiftEnd: 15.5, deskStart: 12,   deskEnd: 13,   maxHoursPerWeek: 30 },
+  { id: 9,  name: 'Kara U.',      shiftStart: 11,   shiftEnd: 16,   deskStart: null, deskEnd: null, maxHoursPerWeek: 15 },
+  { id: 10, name: 'Langston C.',  shiftStart: 12,   shiftEnd: 17,   deskStart: 13,   deskEnd: 14,   maxHoursPerWeek: 30 },
+  { id: 11, name: 'Lars L.',      shiftStart: 12,   shiftEnd: 17,   deskStart: null, deskEnd: null, maxHoursPerWeek: 20 },
+  { id: 12, name: 'Mariah E.',    shiftStart: 12.5, shiftEnd: 17.5, deskStart: 14,   deskEnd: 15,   maxHoursPerWeek: 30 },
+  { id: 13, name: 'Nova N.',      shiftStart: 13,   shiftEnd: 18,   deskStart: 15,   deskEnd: 16,   maxHoursPerWeek: 15 },
+  { id: 14, name: 'Shreyans D.',  shiftStart: 13.5, shiftEnd: 18.5, deskStart: null, deskEnd: null, maxHoursPerWeek: 30 },
+  { id: 15, name: 'Michael M.',   shiftStart: 13.5, shiftEnd: 18.5, deskStart: 16,   deskEnd: 17,   maxHoursPerWeek: 30 },
+];
+
+// ── Staffing targets (by day-of-week group) ───────────────────────────────────
+// dow: 0=Sun, 1=Mon … 6=Sat
+export const staffingTargetsByDay = {
+  weekday: [ // Mon–Fri (dow 1–5)
+    { start: 7.5, end: 8,    min: 2 },
+    { start: 8,   end: 9,    min: 2 },
+    { start: 9,   end: 10,   min: 3 },
+    { start: 10,  end: 17,   min: 5 },
+    { start: 17,  end: 18,   min: 3 },
+    { start: 18,  end: 18.5, min: 2 },
+  ],
+  sunday: [ // Sun (dow 0)
+    { start: 12,  end: 13,   min: 2 },
+    { start: 13,  end: 17,   min: 5 },
+    { start: 17,  end: 18,   min: 3 },
+    { start: 18,  end: 18.5, min: 2 },
+  ],
+  saturday: [], // closed
+};
+
+// ── Events ────────────────────────────────────────────────────────────────────
+// June 2026: Jun 1=Mon, Jun 7=Sun, Jun 13=Sat, Jun 19=Fri, Jun 25=Thu
+export const initialEvents = [
+  {
+    id: 1,
+    name: 'Story Time',
+    type: 'program',
+    start: 10,
+    end: 11,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: "Children's program room",
+    days: ['2026-01-07'],
+    repeating: true,
+  },
+  {
+    id: 3,
+    name: 'Tech Help Session',
+    type: 'program',
+    start: 15,
+    end: 17,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: 'Needs one more person',
+    days: ['2026-01-07'],
+    repeating: true,
+  },
+  {
+    id: 4,
+    name: 'Summer Reading Kickoff',
+    type: 'program',
+    start: 10,
+    end: 12,
+    staffNeeded: 3,
+    assignedStaff: [],
+    notes: 'Main hall — prizes and sign-ups',
+    days: ['2026-06-07'],
+    repeating: false,
+  },
+  {
+    id: 5,
+    name: 'Teen Volunteer Orientation',
+    type: 'meeting',
+    start: 15,
+    end: 16,
+    staffNeeded: 1,
+    assignedStaff: [],
+    notes: 'Meeting room B',
+    days: ['2026-06-10'],
+    repeating: false,
+  },
+  {
+    id: 6,
+    name: 'Board Game Night',
+    type: 'program',
+    start: 18,
+    end: 21,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: 'Community room — bring snacks',
+    days: ['2026-06-13'],
+    repeating: true,
+  },
+  {
+    id: 7,
+    name: 'Author Talk',
+    type: 'program',
+    start: 18,
+    end: 19.5,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: 'Large meeting room',
+    days: ['2026-06-18'],
+    repeating: false,
+  },
+  {
+    id: 8,
+    name: 'Kids Craft Workshop',
+    type: 'workshop',
+    start: 11,
+    end: 13,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: 'Arts & crafts room',
+    days: ['2026-06-21'],
+    repeating: false,
+  },
+  {
+    id: 9,
+    name: 'Summer Concert',
+    type: 'program',
+    start: 19,
+    end: 21,
+    staffNeeded: 3,
+    assignedStaff: [],
+    notes: 'Outdoor courtyard',
+    days: ['2026-06-27'],
+    repeating: false,
+  },
+  {
+    id: 10,
+    name: 'Library Orientation',
+    type: 'program',
+    start: 9,
+    end: 10,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: 'Front lobby — new card sign-ups',
+    days: ['2026-06-02'],
+    repeating: false,
+  },
+  {
+    id: 11,
+    name: 'Photography Exhibit Opening',
+    type: 'program',
+    start: 14,
+    end: 16,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: 'Gallery hallway — local artists',
+    days: ['2026-06-05'],
+    repeating: false,
+  },
+  {
+    id: 12,
+    name: 'Toddler Story Time Special',
+    type: 'program',
+    start: 10,
+    end: 11,
+    staffNeeded: 1,
+    assignedStaff: [],
+    notes: "Children's room — stuffed animal day",
+    days: ['2026-06-04'],
+    repeating: false,
+  },
+  {
+    id: 13,
+    name: 'ESL Conversation Circle',
+    type: 'program',
+    start: 10,
+    end: 12,
+    staffNeeded: 1,
+    assignedStaff: [],
+    notes: 'Meeting room A — all levels welcome',
+    days: ['2026-06-09'],
+    repeating: false,
+  },
+  {
+    id: 14,
+    name: 'Movie Night',
+    type: 'program',
+    start: 18,
+    end: 21,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: 'Community room — popcorn provided',
+    days: ['2026-06-12'],
+    repeating: false,
+  },
+  {
+    id: 15,
+    name: 'Career Development Workshop',
+    type: 'workshop',
+    start: 13,
+    end: 15,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: 'Meeting room B — résumé & interview tips',
+    days: ['2026-06-16'],
+    repeating: false,
+  },
+  {
+    id: 16,
+    name: 'Watercolor Class',
+    type: 'workshop',
+    start: 14,
+    end: 16,
+    staffNeeded: 1,
+    assignedStaff: [],
+    notes: 'Arts & crafts room — supplies provided',
+    days: ['2026-06-17'],
+    repeating: false,
+  },
+  {
+    id: 17,
+    name: 'Dungeons & Dragons Night',
+    type: 'program',
+    start: 17,
+    end: 21,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: 'Community room — all experience levels',
+    days: ['2026-06-20'],
+    repeating: false,
+  },
+  {
+    id: 18,
+    name: 'Coding for Kids',
+    type: 'workshop',
+    start: 11,
+    end: 13,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: 'Computer lab — ages 8–14',
+    days: ['2026-06-23'],
+    repeating: false,
+  },
+  {
+    id: 19,
+    name: 'Local History Talk',
+    type: 'program',
+    start: 15,
+    end: 16.5,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: 'Large meeting room — guest speaker',
+    days: ['2026-06-24'],
+    repeating: false,
+  },
+  {
+    id: 20,
+    name: 'Seed Library Workshop',
+    type: 'workshop',
+    start: 14,
+    end: 15.5,
+    staffNeeded: 2,
+    assignedStaff: [],
+    notes: 'Community garden — seed swapping',
+    days: ['2026-06-26'],
+    repeating: false,
+  },
+];
+
+// Weekly templates used to live here, standing in for any date that had no
+// saved schedule. Schedules come from the database now, so a date with no row
+// simply has nobody on it — substituting this seed meant real staff were shown
+// invented shifts on days they were never scheduled. Removed rather than left
+// unused, so nothing reaches for it again.

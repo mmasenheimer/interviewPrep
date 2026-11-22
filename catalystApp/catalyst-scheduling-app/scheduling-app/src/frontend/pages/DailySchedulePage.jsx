@@ -1,0 +1,2520 @@
+import { useState, useEffect, useRef, useMemo, memo } from 'react';
+import { useScheduleContext } from '../context/ScheduleContext';
+import { buildAlerts, formatTime, mergeStaffOverrides, removeShiftAndSweep, sweepDutiesAfterResize, clearDaySchedule, withRangeStart, newShiftAt, hourAtPointer, editStampOf, describeEditStamp, formatEditTime, getEventsForDate, toDateStr, stretchShiftsToCoverEvents, mergeStaffShifts, deskBoundsFor, vrBoundsFor, dutyBoundsFor, oneOnOneLabel } from '../utils/scheduleUtils';
+import { HOURS_START, HOURS_END, EVENT_TYPES } from '../../data/mockData';
+// Availability comes from ScheduleContext (backed by the database), not from a
+// hardcoded file — see the note on `availability` in hooks/useSchedule.js.
+import { useTemplates } from '../context/TemplatesContext';
+import { useDragAutoScroll } from '../hooks/useDragAutoScroll';
+import { schedulesApi, isConflict } from '../utils/api';
+import { ApplyTemplateCalendarModal } from '../components/ApplyTemplateCalendarModal';
+import { RangeCalendar } from '../components/RangeCalendar';
+import { ArrowLeftIcon } from '../components/ArrowLeftIcon';
+import { ArrowRightIcon } from '../components/ArrowRightIcon';
+import { DeleteIcon } from '../components/DeleteIcon';
+import { ContextMenu } from '../components/ContextMenu';
+import { BarColorPicker } from '../components/BarColorPicker';
+import { RippleButton } from '../components/RippleButton';
+import { useSettings } from '../context/SettingsContext';
+
+const TOTAL_HOURS = HOURS_END - HOURS_START;
+// Grid lines across each timeline row: every hour, plus a fainter one at :30.
+const HOUR_MARKS      = Array.from({ length: TOTAL_HOURS - 1 }, (_, i) => HOURS_START + i + 1);
+const HALF_HOUR_MARKS = Array.from({ length: TOTAL_HOURS }, (_, i) => HOURS_START + i + 0.5);
+
+const DOW_TO_DAY    = { 0: 'Sunday', 1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 4: 'Thursday', 5: 'Friday' };
+
+function snapHalf(h)        { return Math.round(h * 2) / 2; }
+function clamp(v, lo, hi)   { return Math.max(lo, Math.min(hi, v)); }
+
+function normalizeStaff(s) {
+  const shifts = s.shifts ?? (s.scheduled && s.shiftStart != null
+    ? [{ id: `s${s.id}-0`, start: s.shiftStart, end: s.shiftEnd }]
+    : []);
+  const deskShifts = s.deskShifts ?? (s.scheduled && s.deskStart != null
+    ? [{ id: `d${s.id}-0`, start: s.deskStart, end: s.deskEnd }]
+    : []);
+  const vrShifts = s.vrShifts ?? (s.scheduled && s.vrStart != null
+    ? [{ id: `v${s.id}-0`, start: s.vrStart, end: s.vrEnd }]
+    : []);
+  // No legacy scalar pair to fall back to — 1-1s only ever existed as an array.
+  const oneOnOnes = s.oneOnOnes ?? [];
+  return {
+    ...s,
+    shifts,
+    deskShifts,
+    vrShifts,
+    oneOnOnes,
+    scheduled: shifts.length > 0,
+    shiftStart: s.shiftStart ?? shifts[0]?.start,
+    shiftEnd:   s.shiftEnd   ?? shifts[0]?.end,
+    deskStart:  s.deskStart  ?? deskShifts[0]?.start ?? null,
+    deskEnd:    s.deskEnd    ?? deskShifts[0]?.end   ?? null,
+    vrStart:    s.vrStart    ?? vrShifts[0]?.start   ?? null,
+    vrEnd:      s.vrEnd      ?? vrShifts[0]?.end     ?? null,
+  };
+}
+
+function firstFreeSlot(bars, duration, from = HOURS_START, to = HOURS_END, avoid = []) {
+  let start = from;
+  while (start + duration <= to) {
+    if (!bars.some(b => start < b.end && start + duration > b.start) &&
+        !avoid.some(b => start < b.end && start + duration > b.start)) return start;
+    start = snapHalf(start + 0.5);
+  }
+  return null;
+}
+
+// ── Stats header ───────────────────────────────────────────────────────────────
+
+function StatsHeader({ staff, events, currentDate, onPrev, onNext, finalized, onFinalize, onUnfinalize, onApplyTemplate, onSaveAsTemplate, onClearDay, stampText }) {
+  const [now, setNow] = useState(new Date());
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 60000);
+    return () => clearInterval(id);
+  }, []);
+
+  const scheduled   = staff.filter(s => s.shifts?.length > 0);
+  const nowHour     = now.getHours() + now.getMinutes() / 60;
+  const onShiftNow  = scheduled.filter(s => s.shifts.some(sh => sh.start <= nowHour && sh.end > nowHour)).length;
+  const dateLabel   = currentDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+  const canClear    = scheduled.length > 0 || events.some(ev => ev.assignedStaff.length > 0);
+  return (
+    // Lifted above the cards below it. .glass-surface applies a backdrop-filter,
+    // which makes every glass card its own stacking context — so without this the
+    // bar-colour picker's popover (z-index 9999) is confined to this header and
+    // the alerts card, being later in the DOM, paints straight over it.
+    <div className="flex flex-wrap justify-between items-center gap-3 p-4 sm:p-5 rounded-md mb-6 border glass-surface"
+      style={{ borderColor: 'var(--color-border)', position: 'relative', zIndex: 20 }}>
+      <div className="flex items-center gap-3">
+        <h2 className="text-xl font-bold" style={{ color: 'var(--color-text)' }}>Daily Schedule</h2>
+        {/* All three are the same button now — solid accent with the ripple
+            hover — so Apply/Save no longer read as secondary to Finalize. */}
+        <RippleButton
+          onClick={finalized ? onUnfinalize : onFinalize}
+          tone={finalized ? 'done' : 'accent'}
+          className="px-3 py-1 rounded-md text-xs font-semibold"
+        >
+          {finalized ? '✓ Finalized' : 'Finalize'}
+        </RippleButton>
+        {!finalized && (
+          <RippleButton onClick={onApplyTemplate} className="px-3 py-1 rounded-md text-xs font-semibold">
+            Apply Template
+          </RippleButton>
+        )}
+        <RippleButton onClick={onSaveAsTemplate} className="px-3 py-1 rounded-md text-xs font-semibold">
+          Save as Template
+        </RippleButton>
+        {!finalized && (
+          <RippleButton
+            onClick={onClearDay}
+            disabled={!canClear}
+            tone="red"
+            className="px-3 py-1 rounded-md text-xs font-semibold"
+            style={{ opacity: canClear ? 1 : 0.5 }}
+          >
+            Clear Day
+          </RippleButton>
+        )}
+        {/* Recolors every event bar on the schedule — not gated on `finalized`,
+            since it's a display preference rather than an edit to the day. */}
+        <BarColorPicker align="left" />
+      </div>
+      <div className="flex items-center gap-2">
+        {stampText && (
+          <span className="text-xs mr-2" style={{ color: 'var(--color-today)' }}>{stampText}</span>
+        )}
+        <button onClick={onPrev} className="px-3 py-1.5 rounded-md text-sm border cursor-pointer flex items-center justify-center"
+          style={{ background: 'var(--color-muted)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}><ArrowLeftIcon size={16} /></button>
+        <span className="text-sm font-medium min-w-36 sm:min-w-48 text-center">{dateLabel}</span>
+        <button onClick={onNext} className="px-3 py-1.5 rounded-md text-sm border cursor-pointer flex items-center justify-center"
+          style={{ background: 'var(--color-muted)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}><ArrowRightIcon size={16} /></button>
+      </div>
+      <div className="flex gap-4 sm:gap-6">
+        {[
+          { label: 'On Shift Today', value: scheduled.length },
+          { label: 'On Shift Now', value: onShiftNow },
+          { label: 'Events',       value: events.length },
+        ].map(({ label, value }) => (
+          <div key={label} className="text-center">
+            <div className="text-xl font-bold" style={{ color: 'var(--color-accent-bright)' }}>{value}</div>
+            <div className="text-xs uppercase tracking-wide" style={{ color: 'var(--color-text-dim)' }}>{label}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Alerts bar ─────────────────────────────────────────────────────────────────
+
+// Memoized so it skips re-rendering (and re-running buildAlerts) while a drag/
+// resize is active — the parent freezes its props during a gesture, so this
+// only recomputes once the gesture ends.
+const AlertsBar = memo(function AlertsBar({ staff, events, dow }) {
+  // From context, not a prop: a settings change must reach this even though the
+  // parent freezes its props during a drag, and a context update bypasses memo.
+  const { vrEnabled } = useSettings();
+  const alerts   = buildAlerts(staff, events, dow, { disabledDuties: vrEnabled ? [] : ['vr'] });
+  // A lookup, not a chain: a type missing here renders a dot with no color at
+  // all rather than falling back to yellow.
+  // A lookup keyed by the alertType each duty declares in DUTIES, so desk's
+  // 'yellow' and VR's 'vr' now resolve to those bars' chosen colors rather than
+  // the app's warning palette.
+  const dotColor = { understaffed: 'var(--color-green)', yellow: 'var(--color-bar-desk-dot)', vr: 'var(--color-bar-vr-dot)', event: 'var(--color-bar-event-dot)', oneOnOne: 'var(--color-bar-oneone-dot)', blue: 'var(--color-accent-bright)' };
+  return (
+    // Trial of the translucent card treatment (.glass-surface in index.css), so
+    // the page backdrop shows through instead of being covered. The background
+    // comes from the class — setting it inline here would override it.
+    <div className="p-3 rounded-md mb-5 border glass-surface"
+      style={{ borderColor: 'var(--color-border)' }}>
+      <h3 className="text-sm font-semibold mb-1.5" style={{ color: 'var(--color-yellow)' }}>Alerts</h3>
+      {alerts.map((a, i) => (
+        <div key={i} className="flex items-center gap-2 py-0.5 text-sm" style={{ color: 'var(--color-text-dim)' }}>
+          <span className="w-2 h-2 rounded-full shrink-0" style={{ background: dotColor[a.type] }} />
+          {a.text}
+        </div>
+      ))}
+    </div>
+  );
+});
+
+// ── Schedule grid ──────────────────────────────────────────────────────────────
+
+function ScheduleGrid({
+  staff, events, finalized,
+  onBarMouseDown, onDeskBarMouseDown, onVrBarMouseDown, onOneOnOneBarMouseDown, onEventBarMouseDown, activeBar,
+  activeDragType, hoverRow, onTimelineDragOver, onTimelineDrop,
+  draggingBarInfo,
+  onShiftBarDragStart, onDeskBarDragStart, onVrBarDragStart, onOneOnOneBarDragStart, onEventBarDragStart, onBarDragEnd,
+  onBarDragOver, onBarDrop,
+  onBarContextMenu,
+  onNewShift,
+  getPersonAvailability,
+  previewInfo,
+}) {
+  const { vrEnabled } = useSettings();
+  const hours = Array.from({ length: TOTAL_HOURS }, (_, i) => HOURS_START + i);
+
+  function posStyle(start, end) {
+    const left  = ((start - HOURS_START) / TOTAL_HOURS) * 100;
+    const width = ((end   - start)       / TOTAL_HOURS) * 100;
+    return { left: `${left}%`, width: `${width}%` };
+  }
+
+  const currentDragType = activeDragType ?? draggingBarInfo?.type;
+
+  const toolbarHighlight = activeDragType === 'shift'
+    ? { background: 'rgba(74,124,94,0.15)',  borderColor: 'var(--color-green)' }
+    : activeDragType === 'desk'
+      ? { background: 'var(--color-bar-desk-fill-soft)', borderColor: 'var(--color-bar-desk-bright)' }
+      : activeDragType === 'vr'
+        ? { background: 'var(--color-bar-vr-fill-soft)', borderColor: 'var(--color-bar-vr-bright)' }
+        : activeDragType === 'oneOnOne'
+          ? { background: 'var(--color-bar-oneone-fill-soft)', borderColor: 'var(--color-bar-oneone-bright)' }
+          : { background: 'var(--color-bar-event-fill-soft)', borderColor: 'var(--color-bar-event-bright)' };
+
+  return (
+    <>
+    <div className="rounded-md border overflow-x-auto mb-6 glass-surface"
+      style={{ borderColor: 'var(--color-border)' }}>
+
+      {/* Time header */}
+      <div className="flex border-b" style={{ borderColor: 'var(--color-border)', minWidth: 972 }}>
+        <div className="w-48 shrink-0 p-3 text-xs uppercase tracking-wide border-r"
+          style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-dim)' }}>Staff</div>
+        <div className="flex-1 flex relative">
+          {hours.map(h => (
+            <div key={h} className="flex-1 p-2 text-xs text-center border-r last:border-r-0"
+              style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-dim)' }}>
+              {formatTime(h)}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Staff rows */}
+      {staff.map((person, i) => {
+        return (
+          <div
+            key={person.id}
+            className="flex border-b last:border-b-0"
+            style={{
+              borderColor: 'var(--color-border)',
+              minWidth: 972,
+              opacity: person.shifts.length > 0 ? 1 : 0.5,
+              transition: 'opacity 0.15s',
+            }}
+          >
+            {/* Name column */}
+            <div className="w-48 shrink-0 px-2 py-1.5 text-xs border-r flex items-center gap-1.5"
+              style={{ borderColor: 'var(--color-border)' }}
+              onContextMenu={e => {
+                // A bar on the row handles its own right-click first.
+                if (e.defaultPrevented || finalized || person.shifts.length > 0) return;
+                e.preventDefault();
+                onNewShift(i, null);
+              }}>
+              <div className="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0"
+                style={{ background: 'var(--color-muted)', color: 'var(--color-text-dim)' }}>
+                {person.name.split(' ').map(n => n[0]).join('')}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="font-medium truncate">{person.name}</div>
+                {person.shifts.length > 0 ? (
+                  <div className="truncate mt-0.5" style={{ color: 'var(--color-text-dim)', fontSize: 10 }}>
+                    {person.shifts.length === 1
+                      ? `${formatTime(person.shifts[0].start)} – ${formatTime(person.shifts[0].end)}`
+                      : `${person.shifts.length} shifts`}
+                  </div>
+                ) : (
+                  <div className="mt-0.5" style={{ color: 'var(--color-muted)', fontSize: 10 }}>Unscheduled</div>
+                )}
+              </div>
+            </div>
+
+            {/* Timeline */}
+            <div
+              className="flex-1 relative"
+              data-timeline="true"
+              style={{ height: 46 }}
+              // Right-clicking an unscheduled person opens the shift editor for
+              // a new shift starting where they clicked.
+              onContextMenu={e => {
+                // A bar on the row handles its own right-click first.
+                if (e.defaultPrevented || finalized || person.shifts.length > 0) return;
+                e.preventDefault();
+                onNewShift(i, hourAtPointer(e, e.currentTarget));
+              }}
+              onDragOver={e => {
+                const hasToolbar = !!activeDragType;
+                const hasBar     = !!draggingBarInfo;
+                if (!hasToolbar && !hasBar) return;
+                e.preventDefault();
+                e.stopPropagation();
+                if (hasToolbar) onTimelineDragOver(e, i);
+                if (hasBar)     onBarDragOver(e, i);
+              }}
+              onDrop={e => {
+                const hasToolbar = !!activeDragType;
+                const hasBar     = !!draggingBarInfo;
+                if (!hasToolbar && !hasBar) return;
+                e.preventDefault();
+                e.stopPropagation();
+                if (hasToolbar) onTimelineDrop(i);
+                if (hasBar)     onBarDrop(e, i);
+              }}
+            >
+              {/* Hour lines and fainter :30 marks, behind everything else on the row */}
+              {HOUR_MARKS.map(h => (
+                <div key={`h-${h}`} style={{
+                  position: 'absolute', top: 0, bottom: 0, width: 1, pointerEvents: 'none',
+                  left: `${((h - HOURS_START) / TOTAL_HOURS) * 100}%`,
+                  background: 'rgba(255,255,255,0.13)',
+                }} />
+              ))}
+              {HALF_HOUR_MARKS.map(h => (
+                <div key={`hh-${h}`} style={{
+                  position: 'absolute', top: 0, bottom: 0, width: 1, pointerEvents: 'none',
+                  left: `${((h - HOURS_START) / TOTAL_HOURS) * 100}%`,
+                  background: 'rgba(255,255,255,0.05)',
+                }} />
+              ))}
+              {/* Availability background — sits behind all bars */}
+              {getPersonAvailability?.(person.id).map((block, bi) => (
+                <div
+                  key={`avail-${bi}`}
+                  style={{
+                    position: 'absolute',
+                    top: 0, bottom: 0,
+                    ...posStyle(block.start, block.end),
+                    background: 'rgba(96, 165, 250, 0.10)',
+                    border: '1px solid rgba(96, 165, 250, 0.22)',
+                    borderRadius: 4,
+                    zIndex: 0,
+                    pointerEvents: 'none',
+                  }}
+                />
+              ))}
+
+              {/* Toolbar-chip drop highlight (skip for events — preview ghost is more precise) */}
+              {activeDragType && activeDragType !== 'event' && hoverRow === i && (
+                <div className="absolute inset-0 pointer-events-none rounded-r-lg"
+                  style={{ ...toolbarHighlight, border: '1px dashed', zIndex: 20 }} />
+              )}
+
+              {/* Placement preview ghost (shift=green, desk=yellow, event=purple, invalid=red) */}
+              {previewInfo?.staffIndex === i && previewInfo.start !== null && (
+                <div
+                  className="absolute pointer-events-none rounded"
+                  style={{
+                    top: '50%', transform: 'translateY(-50%)', height: 28,
+                    left:  `${((previewInfo.start - HOURS_START) / TOTAL_HOURS) * 100}%`,
+                    width: `${((previewInfo.end - previewInfo.start) / TOTAL_HOURS) * 100}%`,
+                    background: previewInfo.valid
+                      ? (currentDragType === 'shift' ? 'rgba(74,124,94,0.35)' : currentDragType === 'desk' ? 'var(--color-bar-desk-fill-strong)' : currentDragType === 'vr' ? 'var(--color-bar-vr-fill-strong)' : currentDragType === 'oneOnOne' ? 'var(--color-bar-oneone-fill-strong)' : 'var(--color-bar-event-fill-strong)')
+                      : 'rgba(200,64,64,0.25)',
+                    border: `2px dashed ${previewInfo.valid
+                      ? (currentDragType === 'shift' ? 'var(--color-green)' : currentDragType === 'desk' ? 'var(--color-bar-desk-bright)' : currentDragType === 'vr' ? 'var(--color-bar-vr-bright)' : currentDragType === 'oneOnOne' ? 'var(--color-bar-oneone-bright)' : 'var(--color-bar-event-bright)')
+                      : 'var(--color-red)'}`,
+                    zIndex: 22,
+                  }}
+                />
+              )}
+
+              {/* Shift bars */}
+              {person.shifts.map((shift, si) => {
+                const isBarActive     = activeBar?.type === 'shift' && activeBar?.staffIndex === i && activeBar?.shiftIndex === si;
+                const isShiftDragging = draggingBarInfo?.type === 'shift' && draggingBarInfo?.staffIndex === i && draggingBarInfo?.shiftIndex === si;
+                return (
+                  <div
+                    key={shift.id}
+                    draggable={!finalized}
+                    className="absolute h-6 rounded overflow-hidden select-none"
+                    style={{
+                      ...posStyle(shift.start, shift.end),
+                      top: '50%', transform: 'translateY(-50%)',
+                      background: 'var(--color-green)',
+                      opacity: isShiftDragging ? 0.3 : (isBarActive ? 0.85 : 0.6),
+                      cursor: finalized ? 'default' : 'grab',
+                      boxShadow: isBarActive ? '0 0 0 2px var(--color-green)' : 'none',
+                      transition: isBarActive || isShiftDragging ? 'none' : 'box-shadow 0.1s',
+                      zIndex: isBarActive ? 10 : 1,
+                    }}
+                    onDragStart={e => { e.stopPropagation(); !finalized && onShiftBarDragStart(e, i, si); }}
+                    onDragEnd={onBarDragEnd}
+                    onContextMenu={e => { e.preventDefault(); !finalized && onBarContextMenu(e, { type: 'shift', staffIndex: i, shiftIndex: si }); }}
+                  >
+                    {!finalized && (
+                      <div
+                        style={{ position: 'absolute', left: 0, top: 0, width: 7, height: '100%', cursor: 'ew-resize', background: 'rgba(255,255,255,0.18)', zIndex: 2 }}
+                        onMouseDown={e => { e.stopPropagation(); e.preventDefault(); onBarMouseDown(e, i, si, 'left'); }}
+                      />
+                    )}
+                    {!finalized && (
+                      <div
+                        style={{ position: 'absolute', right: 0, top: 0, width: 7, height: '100%', cursor: 'ew-resize', background: 'rgba(255,255,255,0.18)', zIndex: 2 }}
+                        onMouseDown={e => { e.stopPropagation(); e.preventDefault(); onBarMouseDown(e, i, si, 'right'); }}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+
+              {/* Desk bars */}
+              {person.deskShifts.map((desk, di) => {
+                const isDeskActive    = activeBar?.type === 'desk' && activeBar?.staffIndex === i && activeBar?.deskIndex === di;
+                const isDeskDragging  = draggingBarInfo?.type === 'desk' && draggingBarInfo?.staffIndex === i && draggingBarInfo?.deskIndex === di;
+                return (
+                  <div
+                    key={desk.id}
+                    draggable={!finalized}
+                    className="absolute h-6 rounded overflow-hidden select-none"
+                    style={{
+                      ...posStyle(desk.start, desk.end),
+                      top: '50%', transform: 'translateY(-50%)',
+                      background: 'var(--color-bar-desk)',
+                      opacity: isDeskDragging ? 0.3 : (isDeskActive ? 1 : 0.75),
+                      cursor: finalized ? 'default' : 'grab',
+                      boxShadow: isDeskActive ? '0 0 0 2px var(--color-bar-desk-bright)' : 'none',
+                      transition: isDeskActive || isDeskDragging ? 'none' : 'box-shadow 0.1s',
+                      zIndex: isDeskActive ? 10 : 2,
+                    }}
+                    onDragStart={e => { e.stopPropagation(); !finalized && onDeskBarDragStart(e, i, di); }}
+                    onDragEnd={onBarDragEnd}
+                    onContextMenu={e => { e.preventDefault(); !finalized && onBarContextMenu(e, { type: 'desk', staffIndex: i, deskIndex: di }); }}
+                  >
+                    {!finalized && (
+                      <div
+                        style={{ position: 'absolute', left: 0, top: 0, width: 7, height: '100%', cursor: 'ew-resize', background: 'rgba(255,255,255,0.15)', zIndex: 2 }}
+                        onMouseDown={e => { e.stopPropagation(); e.preventDefault(); onDeskBarMouseDown(e, i, di, 'left'); }}
+                      />
+                    )}
+                    <span className="absolute inset-0 flex items-center justify-center pointer-events-none"
+                      style={{ fontSize: 9, color: 'white', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', paddingLeft: 10, paddingRight: 10 }}>
+                      Desk
+                    </span>
+                    {!finalized && (
+                      <div
+                        style={{ position: 'absolute', right: 0, top: 0, width: 7, height: '100%', cursor: 'ew-resize', background: 'rgba(255,255,255,0.15)', zIndex: 2 }}
+                        onMouseDown={e => { e.stopPropagation(); e.preventDefault(); onDeskBarMouseDown(e, i, di, 'right'); }}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+
+              {/* VR bars — identical to desk in every behaviour, different post.
+                  Sits in the same vertical band because a person can't hold both
+                  at once; on the rare overlap the alert flags, the higher
+                  z-index keeps this one clickable rather than buried. */}
+              {vrEnabled && person.vrShifts.map((vr, vi) => {
+                const isVrActive   = activeBar?.type === 'vr' && activeBar?.staffIndex === i && activeBar?.vrIndex === vi;
+                const isVrDragging = draggingBarInfo?.type === 'vr' && draggingBarInfo?.staffIndex === i && draggingBarInfo?.vrIndex === vi;
+                return (
+                  <div
+                    key={vr.id}
+                    draggable={!finalized}
+                    className="absolute h-6 rounded overflow-hidden select-none"
+                    style={{
+                      ...posStyle(vr.start, vr.end),
+                      top: '50%', transform: 'translateY(-50%)',
+                      background: 'var(--color-bar-vr)',
+                      opacity: isVrDragging ? 0.3 : (isVrActive ? 1 : 0.75),
+                      cursor: finalized ? 'default' : 'grab',
+                      boxShadow: isVrActive ? '0 0 0 2px var(--color-bar-vr-bright)' : 'none',
+                      transition: isVrActive || isVrDragging ? 'none' : 'box-shadow 0.1s',
+                      zIndex: isVrActive ? 10 : 3,
+                    }}
+                    onDragStart={e => { e.stopPropagation(); !finalized && onVrBarDragStart(e, i, vi); }}
+                    onDragEnd={onBarDragEnd}
+                    onContextMenu={e => { e.preventDefault(); !finalized && onBarContextMenu(e, { type: 'vr', staffIndex: i, vrIndex: vi }); }}
+                  >
+                    {!finalized && (
+                      <div
+                        style={{ position: 'absolute', left: 0, top: 0, width: 7, height: '100%', cursor: 'ew-resize', background: 'rgba(255,255,255,0.15)', zIndex: 2 }}
+                        onMouseDown={e => { e.stopPropagation(); e.preventDefault(); onVrBarMouseDown(e, i, vi, 'left'); }}
+                      />
+                    )}
+                    <span className="absolute inset-0 flex items-center justify-center pointer-events-none"
+                      style={{ fontSize: 9, color: 'white', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', paddingLeft: 10, paddingRight: 10 }}>
+                      VR
+                    </span>
+                    {!finalized && (
+                      <div
+                        style={{ position: 'absolute', right: 0, top: 0, width: 7, height: '100%', cursor: 'ew-resize', background: 'rgba(255,255,255,0.15)', zIndex: 2 }}
+                        onMouseDown={e => { e.stopPropagation(); e.preventDefault(); onVrBarMouseDown(e, i, vi, 'right'); }}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+
+              {/* 1-1 bars — a meeting inside a shift rather than a staffed post,
+                  so unlike desk and VR nothing requires one and any number of
+                  people can be in one at once. Placement still avoids the other
+                  in-shift bars because they all share this vertical band. */}
+              {(person.oneOnOnes ?? []).map((ooo, oi) => {
+                const isOooActive   = activeBar?.type === 'oneOnOne' && activeBar?.staffIndex === i && activeBar?.oneOnOneIndex === oi;
+                const isOooDragging = draggingBarInfo?.type === 'oneOnOne' && draggingBarInfo?.staffIndex === i && draggingBarInfo?.oneOnOneIndex === oi;
+                return (
+                  <div
+                    key={ooo.id}
+                    draggable={!finalized}
+                    className="absolute h-6 rounded overflow-hidden select-none"
+                    title={oneOnOneLabel(ooo)}
+                    style={{
+                      ...posStyle(ooo.start, ooo.end),
+                      top: '50%', transform: 'translateY(-50%)',
+                      background: 'var(--color-bar-oneone)',
+                      opacity: isOooDragging ? 0.3 : (isOooActive ? 1 : 0.85),
+                      cursor: finalized ? 'default' : 'grab',
+                      boxShadow: isOooActive ? '0 0 0 2px var(--color-bar-oneone-bright)' : 'none',
+                      transition: isOooActive || isOooDragging ? 'none' : 'box-shadow 0.1s',
+                      zIndex: isOooActive ? 10 : 4,
+                    }}
+                    onDragStart={e => { e.stopPropagation(); !finalized && onOneOnOneBarDragStart(e, i, oi); }}
+                    onDragEnd={onBarDragEnd}
+                    onContextMenu={e => { e.preventDefault(); !finalized && onBarContextMenu(e, { type: 'oneOnOne', staffIndex: i, oneOnOneIndex: oi }); }}
+                  >
+                    {!finalized && (
+                      <div
+                        style={{ position: 'absolute', left: 0, top: 0, width: 7, height: '100%', cursor: 'ew-resize', background: 'rgba(255,255,255,0.15)', zIndex: 2 }}
+                        onMouseDown={e => { e.stopPropagation(); e.preventDefault(); onOneOnOneBarMouseDown(e, i, oi, 'left'); }}
+                      />
+                    )}
+                    <span className="absolute inset-0 flex items-center justify-center pointer-events-none"
+                      style={{ fontSize: 9, color: 'var(--color-bar-text)', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', paddingLeft: 10, paddingRight: 10 }}>
+                      {oneOnOneLabel(ooo, { short: true })}
+                    </span>
+                    {!finalized && (
+                      <div
+                        style={{ position: 'absolute', right: 0, top: 0, width: 7, height: '100%', cursor: 'ew-resize', background: 'rgba(255,255,255,0.15)', zIndex: 2 }}
+                        onMouseDown={e => { e.stopPropagation(); e.preventDefault(); onOneOnOneBarMouseDown(e, i, oi, 'right'); }}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+
+              {/* Event bars — HTML5 draggable for move/trash, mouse events for resize */}
+              {events.filter(e => e.assignedStaff.includes(person.id)).map(evt => {
+                const isEvtActive   = activeBar?.type === 'event' && activeBar?.eventId === evt.id;
+                const isEvtDragging = draggingBarInfo?.type === 'event' && draggingBarInfo?.eventId === evt.id;
+                return (
+                  <div
+                    key={evt.id}
+                    draggable={!finalized}
+                    className="absolute h-6 rounded overflow-hidden select-none"
+                    style={{
+                      ...posStyle(evt.start, evt.end),
+                      top: '50%', transform: 'translateY(-50%)',
+                      background: 'var(--color-bar-event)',
+                      cursor: finalized ? 'default' : 'grab',
+                      zIndex: isEvtActive ? 10 : 3,
+                      boxShadow: isEvtActive ? '0 0 0 2px var(--color-bar-event-bright)' : 'none',
+                      opacity: isEvtDragging ? 0.3 : (isEvtActive ? 1 : 0.9),
+                      transition: isEvtActive || isEvtDragging ? 'none' : 'box-shadow 0.1s',
+                    }}
+                    onDragStart={e => { e.stopPropagation(); !finalized && onEventBarDragStart(e, evt.id, person.id); }}
+                    onDragEnd={onBarDragEnd}
+                    onContextMenu={e => { e.preventDefault(); !finalized && onBarContextMenu(e, { type: 'event', eventId: evt.id, staffId: person.id }); }}
+                    title={evt.name}
+                  >
+                    {!finalized && (
+                      <div
+                        style={{ position: 'absolute', left: 0, top: 0, width: 7, height: '100%', cursor: 'ew-resize', background: 'rgba(255,255,255,0.15)', zIndex: 2 }}
+                        onMouseDown={e => { e.stopPropagation(); e.preventDefault(); onEventBarMouseDown(e, evt.id, 'left'); }}
+                      />
+                    )}
+                    <span className="absolute inset-0 flex items-center justify-center pointer-events-none"
+                      style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-bar-text)', paddingLeft: 10, paddingRight: 10, whiteSpace: 'nowrap', overflow: 'hidden' }}>
+                      {evt.name}
+                    </span>
+                    {!finalized && (
+                      <div
+                        style={{ position: 'absolute', right: 0, top: 0, width: 7, height: '100%', cursor: 'ew-resize', background: 'rgba(255,255,255,0.15)', zIndex: 2 }}
+                        onMouseDown={e => { e.stopPropagation(); e.preventDefault(); onEventBarMouseDown(e, evt.id, 'right'); }}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+
+            </div>
+          </div>
+        );
+      })}
+    </div>
+    </>
+  );
+}
+
+// ── Drag chip (toolbar source) ─────────────────────────────────────────────────
+
+function DragChip({ label, isActive, color, borderColor, bg, icon, onDragStart, onDragEnd }) {
+  return (
+    <div
+      draggable
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+      title={label}
+      className="flex items-center gap-1.5 px-3 py-1.5 rounded border text-xs font-medium select-none transition-all"
+      style={{
+        borderStyle: 'dashed',
+        borderColor: isActive ? color : borderColor,
+        color: isActive ? color : 'var(--color-text-dim)',
+        background: isActive ? bg : 'transparent',
+        cursor: 'grab',
+        maxWidth: 160,
+      }}
+    >
+      <span style={{ pointerEvents: 'none' }}>{icon}</span>
+      <span className="truncate" style={{ pointerEvents: 'none' }}>{label}</span>
+    </div>
+  );
+}
+
+// ── Edit modal ─────────────────────────────────────────────────────────────────
+
+const TIME_STEPS  = Array.from({ length: (HOURS_END - HOURS_START) * 2 + 1 }, (_, i) => HOURS_START + i * 0.5);
+
+function TimeSelect({ value, onChange, min, max }) {
+  const opts = TIME_STEPS.filter(t => t >= (min ?? HOURS_START) && t <= (max ?? HOURS_END));
+  return (
+    <select
+      value={value}
+      onChange={e => onChange(parseFloat(e.target.value))}
+      style={{
+        width: '100%', padding: '6px 8px', borderRadius: 6, fontSize: 13,
+        background: 'var(--color-muted)', border: '1px solid var(--color-border)',
+        color: 'var(--color-text)',
+      }}
+    >
+      {opts.map(t => <option key={t} value={t}>{formatTime(t)}</option>)}
+    </select>
+  );
+}
+
+function EditModal({ target, orderedStaff, allEvents, onSave, onClose }) {
+  const [form, setForm] = useState(() => {
+    if (target.type === 'shift') {
+      const shift = target.isNew ? target : orderedStaff[target.staffIndex].shifts[target.shiftIndex];
+      return { shiftStart: shift.start, shiftEnd: shift.end };
+    }
+    if (target.type === 'desk') {
+      const desk = orderedStaff[target.staffIndex].deskShifts[target.deskIndex];
+      return { deskStart: desk.start, deskEnd: desk.end };
+    }
+    if (target.type === 'vr') {
+      const vr = orderedStaff[target.staffIndex].vrShifts[target.vrIndex];
+      return { vrStart: vr.start, vrEnd: vr.end };
+    }
+    if (target.type === 'oneOnOne') {
+      const ooo = orderedStaff[target.staffIndex].oneOnOnes[target.oneOnOneIndex];
+      return { oooKind: ooo.kind ?? '', oooWith: ooo.withWhom ?? '', oooStart: ooo.start, oooEnd: ooo.end };
+    }
+    const evt = allEvents.find(e => e.id === target.eventId);
+    return { name: evt?.name || '', type: evt?.type || 'program', start: evt?.start || 9, end: evt?.end || 10, staffNeeded: evt?.staffNeeded || 1, notes: evt?.notes || '', repeating: !!evt?.repeating, repeatFrom: evt?.repeatFrom ?? null, repeatUntil: evt?.repeatUntil ?? null, days: evt?.days ?? [] };
+  });
+
+  useEffect(() => {
+    function onKey(e) { if (e.key === 'Escape') onClose(); }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const title = target.type === 'shift' ? (target.isNew ? 'New Shift' : 'Edit Shift')
+    : target.type === 'desk' ? 'Edit Desk Shift'
+    : target.type === 'vr' ? 'Edit VR Shift'
+    : target.type === 'oneOnOne' ? 'Edit 1-1' : 'Edit Event';
+  const staffName = (target.type === 'shift' || target.type === 'desk' || target.type === 'vr' || target.type === 'oneOnOne')
+    ? orderedStaff[target.staffIndex]?.name : null;
+  const shiftBounds = null;
+
+  const fieldLabel = { display: 'block', fontSize: 12, color: 'var(--color-text-dim)', marginBottom: 4 };
+  const textInput = {
+    width: '100%', padding: '6px 8px', borderRadius: 6, fontSize: 13, boxSizing: 'border-box',
+    background: 'var(--color-muted)', border: '1px solid var(--color-border)', color: 'var(--color-text)',
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-[9998] flex items-center justify-center"
+      style={{ background: 'rgba(0,0,0,0.6)' }}
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-sm mx-4 rounded-xl border p-5"
+        style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', boxShadow: '0 8px 32px rgba(0,0,0,0.5)' }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h3 className="text-base font-bold" style={{ color: 'var(--color-text)' }}>{title}</h3>
+            {staffName && <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-dim)' }}>{staffName}</p>}
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--color-text-dim)', cursor: 'pointer', fontSize: 18, lineHeight: 1, padding: '0 4px' }}>✕</button>
+        </div>
+
+        <div className="flex flex-col gap-3">
+          {target.type === 'shift' && (
+            <>
+              <div>
+                <label style={fieldLabel}>Shift Start</label>
+                <TimeSelect value={form.shiftStart} onChange={v => setForm(f => { const r = withRangeStart({ start: f.shiftStart, end: f.shiftEnd }, v); return { ...f, shiftStart: r.start, shiftEnd: r.end }; })} max={HOURS_END - 0.5} />
+              </div>
+              <div>
+                <label style={fieldLabel}>Shift End</label>
+                <TimeSelect value={form.shiftEnd} onChange={v => setForm(f => ({ ...f, shiftEnd: Math.max(v, f.shiftStart + 0.5) }))} min={form.shiftStart + 0.5} />
+              </div>
+            </>
+          )}
+          {target.type === 'desk' && (
+            <>
+              <div>
+                <label style={fieldLabel}>Desk Start</label>
+                <TimeSelect value={form.deskStart} onChange={v => setForm(f => ({ ...f, deskStart: Math.min(v, f.deskEnd - 0.5) }))} min={shiftBounds?.min} max={form.deskEnd - 0.5} />
+              </div>
+              <div>
+                <label style={fieldLabel}>Desk End</label>
+                <TimeSelect value={form.deskEnd} onChange={v => setForm(f => ({ ...f, deskEnd: Math.max(v, f.deskStart + 0.5) }))} min={form.deskStart + 0.5} max={shiftBounds?.max} />
+              </div>
+            </>
+          )}
+          {target.type === 'vr' && (
+            <>
+              <div>
+                <label style={fieldLabel}>VR Start</label>
+                <TimeSelect value={form.vrStart} onChange={v => setForm(f => ({ ...f, vrStart: Math.min(v, f.vrEnd - 0.5) }))} min={shiftBounds?.min} max={form.vrEnd - 0.5} />
+              </div>
+              <div>
+                <label style={fieldLabel}>VR End</label>
+                <TimeSelect value={form.vrEnd} onChange={v => setForm(f => ({ ...f, vrEnd: Math.max(v, f.vrStart + 0.5) }))} min={form.vrStart + 0.5} max={shiftBounds?.max} />
+              </div>
+            </>
+          )}
+          {target.type === 'oneOnOne' && (
+            <>
+              {/* Both free text: the type of 1-1, and who it's with. Either may be
+                  left blank — a 1-1 is created by dropping it on the grid and
+                  labelled afterwards, so a half-filled one has to be saveable. */}
+              <div>
+                <label style={fieldLabel}>Type of 1-1</label>
+                <input type="text" autoFocus maxLength={200} value={form.oooKind}
+                  onChange={e => setForm(f => ({ ...f, oooKind: e.target.value }))}
+                  placeholder="e.g. Embroidery, Laser, CNC" style={textInput} />
+              </div>
+              <div>
+                <label style={fieldLabel}>1-1 with</label>
+                <input type="text" maxLength={200} value={form.oooWith}
+                  onChange={e => setForm(f => ({ ...f, oooWith: e.target.value }))}
+                  placeholder="Who the 1-1 is with" style={textInput} />
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: -4 }}>
+                Shows on the bar as <strong style={{ color: 'var(--color-text)' }}>{oneOnOneLabel({ kind: form.oooKind, withWhom: form.oooWith }, { short: true })}</strong>
+                {' — '}{oneOnOneLabel({ kind: form.oooKind, withWhom: form.oooWith })} on hover.
+              </div>
+              <div className="flex gap-3">
+                <div className="flex-1">
+                  <label style={fieldLabel}>Start</label>
+                  <TimeSelect value={form.oooStart} onChange={v => setForm(f => ({ ...f, oooStart: Math.min(v, f.oooEnd - 0.5) }))} max={form.oooEnd - 0.5} />
+                </div>
+                <div className="flex-1">
+                  <label style={fieldLabel}>End</label>
+                  <TimeSelect value={form.oooEnd} onChange={v => setForm(f => ({ ...f, oooEnd: Math.max(v, f.oooStart + 0.5) }))} min={form.oooStart + 0.5} />
+                </div>
+              </div>
+            </>
+          )}
+          {target.type === 'event' && (
+            <>
+              <div>
+                <label style={fieldLabel}>Event Name</label>
+                <input type="text" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} style={textInput} />
+              </div>
+              <div>
+                <label style={fieldLabel}>Type</label>
+                <select value={form.type} onChange={e => setForm(f => ({ ...f, type: e.target.value }))} style={textInput}>
+                  {EVENT_TYPES.map(t => <option key={t} value={t}>{t.charAt(0).toUpperCase() + t.slice(1)}</option>)}
+                </select>
+              </div>
+              <div className="flex gap-3">
+                <div className="flex-1">
+                  <label style={fieldLabel}>Start</label>
+                  <TimeSelect value={form.start} onChange={v => setForm(f => ({ ...f, start: Math.min(v, f.end - 0.5) }))} max={form.end - 0.5} />
+                </div>
+                <div className="flex-1">
+                  <label style={fieldLabel}>End</label>
+                  <TimeSelect value={form.end} onChange={v => setForm(f => ({ ...f, end: Math.max(v, f.start + 0.5) }))} min={form.start + 0.5} />
+                </div>
+              </div>
+              <div>
+                <label style={fieldLabel}>Staff Needed</label>
+                <input type="number" min={1} max={20} value={form.staffNeeded} onChange={e => setForm(f => ({ ...f, staffNeeded: parseInt(e.target.value) || 1 }))} style={textInput} />
+              </div>
+              <div>
+                <label style={fieldLabel}>Notes</label>
+                <textarea value={form.notes} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} rows={2} style={{ ...textInput, resize: 'none' }} />
+              </div>
+              {/* Only single-date events can repeat weekly. */}
+              <label
+                className="flex items-center gap-2 select-none"
+                style={{
+                  cursor: (form.days?.length ?? 0) > 1 ? 'not-allowed' : 'pointer',
+                  opacity: (form.days?.length ?? 0) > 1 ? 0.5 : 1,
+                }}
+              >
+                <input
+                  type="checkbox"
+                  disabled={(form.days?.length ?? 0) > 1}
+                  checked={form.repeating && (form.days?.length ?? 0) <= 1}
+                  onChange={e => setForm(f => ({
+                    ...f,
+                    repeating: e.target.checked,
+                    ...(e.target.checked ? {} : { repeatFrom: null, repeatUntil: null }),
+                  }))}
+                  style={{
+                    width: 15, height: 15, accentColor: 'var(--color-accent)',
+                    cursor: (form.days?.length ?? 0) > 1 ? 'not-allowed' : 'pointer',
+                  }}
+                />
+                <span className="text-sm" style={{ color: 'var(--color-text-dim)' }}>Repeats weekly</span>
+              </label>
+              {(form.days?.length ?? 0) > 1 && (
+                <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: -6 }}>
+                  This event has {form.days.length} dates — repetition is only available for single-date events.
+                </p>
+              )}
+              {form.repeating && (form.days?.length ?? 0) <= 1 && (
+                <div>
+                  <label style={fieldLabel}>How long should it repeat?</label>
+                  <RangeCalendar
+                    from={form.repeatFrom}
+                    until={form.repeatUntil}
+                    onChange={({ from, until }) => setForm(f => ({ ...f, repeatFrom: from, repeatUntil: until }))}
+                    highlightDow={form.days?.[0] ? new Date(form.days[0] + 'T00:00:00').getDay() : undefined}
+                  />
+                  <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 6 }}>
+                    Leave empty to repeat indefinitely.
+                  </p>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        <div className="flex gap-2 mt-5 justify-end">
+          <button
+            onClick={onClose}
+            style={{ padding: '7px 16px', borderRadius: 8, fontSize: 13, cursor: 'pointer', background: 'var(--color-muted)', color: 'var(--color-text-dim)', border: '1px solid var(--color-border)' }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => onSave(form)}
+            style={{ padding: '7px 16px', borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: 'pointer', background: 'var(--color-button)', color: 'var(--color-button-text)', border: 'none' }}
+          >
+            Save Changes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Save as day template modal ─────────────────────────────────────────────────
+
+function SaveAsDayTemplateModal({ currentDate, staff, onSave, onClose }) {
+  const [name,      setName]      = useState('');
+  const [desc,      setDesc]      = useState('');
+  const [nameError, setNameError] = useState('');
+  const dayName = DOW_TO_DAY[currentDate.getDay()] ?? 'Monday';
+
+  useEffect(() => {
+    function onKey(e) { if (e.key === 'Escape') onClose(); }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  async function handleSave() {
+    const trimmed = name.trim();
+    if (!trimmed) { setNameError('Template name is required.'); return; }
+    // A duplicate name isn't rejected — addTemplate numbers the copy.
+    try {
+      await onSave({
+        type: 'day',
+        day: dayName,
+        name: trimmed,
+        description: desc.trim(),
+        staff: staff.filter(s => s.shifts?.length > 0),
+      });
+      onClose();
+    } catch (err) {
+      setNameError(err.message || 'Failed to save template.');
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[9998] flex items-center justify-center"
+      style={{ background: 'rgba(0,0,0,0.6)' }} onClick={onClose}>
+      <div className="w-full max-w-sm mx-4 rounded-xl border p-5"
+        style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', boxShadow: '0 8px 32px rgba(0,0,0,0.5)' }}
+        onClick={e => e.stopPropagation()}>
+
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="text-base font-bold" style={{ color: 'var(--color-text)' }}>Save as Day Template</h3>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--color-text-dim)', cursor: 'pointer', fontSize: 18 }}>✕</button>
+        </div>
+        <p className="text-xs mb-4" style={{ color: 'var(--color-text-dim)' }}>
+          Saving {staff.filter(s => s.shifts?.length > 0).length} scheduled staff for <strong style={{ color: 'var(--color-text)' }}>{dayName}</strong>
+        </p>
+
+        <div className="mb-3">
+          <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--color-text-dim)', marginBottom: 5 }}>Template Name *</label>
+          <input
+            autoFocus
+            value={name}
+            onChange={e => { setName(e.target.value); setNameError(''); }}
+            onKeyDown={e => e.key === 'Enter' && handleSave()}
+            placeholder={`e.g. Busy ${dayName}`}
+            style={{
+              width: '100%', padding: '8px 10px', borderRadius: 7, fontSize: 13,
+              background: 'var(--color-muted)', border: `1px solid ${nameError ? 'var(--color-red)' : 'var(--color-border)'}`,
+              color: 'var(--color-text)', outline: 'none', boxSizing: 'border-box',
+            }}
+          />
+          {nameError && <div style={{ fontSize: 11, color: 'var(--color-red)', marginTop: 4 }}>{nameError}</div>}
+        </div>
+        <div className="mb-5">
+          <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--color-text-dim)', marginBottom: 5 }}>Description (optional)</label>
+          <input
+            value={desc}
+            onChange={e => setDesc(e.target.value)}
+            placeholder="Optional notes"
+            style={{
+              width: '100%', padding: '8px 10px', borderRadius: 7, fontSize: 13,
+              background: 'var(--color-muted)', border: '1px solid var(--color-border)',
+              color: 'var(--color-text)', outline: 'none', boxSizing: 'border-box',
+            }}
+          />
+        </div>
+        <div className="flex gap-2 justify-end">
+          <button onClick={onClose}
+            style={{ padding: '7px 16px', borderRadius: 8, fontSize: 13, cursor: 'pointer', background: 'var(--color-muted)', color: 'var(--color-text-dim)', border: '1px solid var(--color-border)' }}>
+            Cancel
+          </button>
+          <button onClick={handleSave}
+            style={{ padding: '7px 16px', borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: 'pointer', background: 'var(--color-button)', color: 'var(--color-button-text)', border: 'none' }}>
+            Save Template
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Warning modal ──────────────────────────────────────────────────────────────
+
+function WarningModal({ title, message, confirmLabel, onConfirm, onCancel }) {
+  useEffect(() => {
+    function onKey(e) { if (e.key === 'Escape') onCancel(); }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onCancel]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[9998] flex items-center justify-center"
+      style={{ background: 'rgba(0,0,0,0.6)' }}
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-sm mx-4 rounded-xl border p-5"
+        style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)', boxShadow: '0 8px 32px rgba(0,0,0,0.5)' }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-start gap-3 mb-4">
+          <span style={{ fontSize: 22, lineHeight: 1.2 }}>⚠️</span>
+          <div>
+            <h3 className="text-base font-bold" style={{ color: 'var(--color-text)' }}>
+              {title}
+            </h3>
+            <p className="text-sm mt-1.5 leading-snug" style={{ color: 'var(--color-text-dim)' }}>
+              {message}
+            </p>
+          </div>
+        </div>
+        <div className="flex gap-2 justify-end">
+          <button
+            onClick={onCancel}
+            style={{ padding: '7px 16px', borderRadius: 8, fontSize: 13, cursor: 'pointer', background: 'var(--color-muted)', color: 'var(--color-text-dim)', border: '1px solid var(--color-border)' }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            style={{ padding: '7px 16px', borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: 'pointer', background: 'var(--color-button)', color: 'var(--color-button-text)', border: 'none' }}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Page ───────────────────────────────────────────────────────────────────────
+
+export default function DailySchedulePage() {
+  const schedule = useScheduleContext();
+  // Stable reader; `schedule.availability` is what changes identity when a fetch
+  // lands, and it's already part of `schedule` so this page re-renders with it.
+  const { getAvailability } = schedule;
+  const { templates, addTemplate } = useTemplates();
+
+  const trashRef = useRef(null);
+
+  const currentDow = schedule.currentDate.getDay();
+  const dateStr    = toDateStr(schedule.currentDate);
+
+  // VR switched off studio-wide removes it from this page entirely: no chip to
+  // drag, no bars, no alerts, and no VR turn counted when deciding whether
+  // something else can be placed (an invisible obstacle would just look broken).
+  // Saved VR turns stay in state and are written back untouched, so it's
+  // reversible — see SettingsContext.
+  const { vrEnabled } = useSettings();
+  const disabledDuties = useMemo(() => (vrEnabled ? [] : ['vr']), [vrEnabled]);
+  const vrOf = p => (vrEnabled ? (p?.vrShifts ?? []) : []);
+
+  // Always derived live — events are global and shouldn't freeze just because
+  // the day's staff schedule was finalized (unlike shifts, there's no reason
+  // a finalized day should show a stale/different event list than reality).
+  const todayEvents = getEventsForDate(schedule.currentDate, schedule.events);
+
+  // Nobody is scheduled until the day's saved schedule arrives from the backend.
+  const [orderedStaff,    setOrderedStaff]    = useState(() =>
+    schedule.staff.map(s => normalizeStaff({ ...s, scheduled: false })),
+  );
+  const [activeBar,       setActiveBar]        = useState(null);   // resize-only mouse drag
+  const [finalized,       setFinalized]        = useState(true);   // days default to finalized until edited
+  const [trashHtmlOver,   setTrashHtmlOver]    = useState(false);
+  const [activeDragType,  setActiveDragType]   = useState(null);   // toolbar chip drag
+  const [draggingEventId, setDraggingEventId]  = useState(null);
+  const [hoverRow,        setHoverRow]         = useState(null);
+  const [draggingBarInfo, setDraggingBarInfo]  = useState(null);   // bar HTML5 drag
+
+  // Lets a drag reach rows below the fold — the toolbar chips sit at the top, so
+  // without this a full roster's lower half is unreachable while dragging.
+  useDragAutoScroll(Boolean(activeDragType || draggingBarInfo));
+  const [contextMenu,     setContextMenu]      = useState(null);   // { x, y, target }
+  const [editModal,       setEditModal]        = useState(null);   // { type, ... }
+  const [pendingWarning,    setPendingWarning]     = useState(null);   // { title, message, confirmLabel, onConfirm, onCancel }
+  const [applyTplOpen,    setApplyTplOpen]     = useState(false);
+  const [saveTplOpen,     setSaveTplOpen]      = useState(false);
+  const [finalizeWarning, setFinalizeWarning]  = useState(null);   // alert list when finalizing with issues
+  const [previewInfo,     setPreviewInfo]      = useState(null);   // { staffIndex, start, end, valid }
+
+  // Frozen inputs for the Alerts bar so it doesn't recompute/flicker mid-drag.
+  const alertsStaffRef  = useRef([]);
+  const alertsEventsRef = useRef([]);
+
+  const shiftDragActiveRef = useRef(false);
+
+  // Timeline row rects only change when the layout actually changes (window
+  // resize), not on every dragover tick — caching avoids forcing a synchronous
+  // reflow on every mousemove-equivalent event during a drag.
+  const rowRectCacheRef = useRef(new Map());
+  function getRowRect(e, rowIdx) {
+    const cached = rowRectCacheRef.current.get(rowIdx);
+    if (cached && cached.el === e.currentTarget) return cached.rect;
+    const rect = e.currentTarget.getBoundingClientRect();
+    rowRectCacheRef.current.set(rowIdx, { el: e.currentTarget, rect });
+    return rect;
+  }
+  useEffect(() => {
+    function onResize() { rowRectCacheRef.current.clear(); }
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  function sortByShift(arr) {
+    return [...arr].sort((a, b) => {
+      const aMin = a.shifts?.length ? Math.min(...a.shifts.map(s => s.start)) : Infinity;
+      const bMin = b.shifts?.length ? Math.min(...b.shifts.map(s => s.start)) : Infinity;
+      return aMin - bMin;
+    });
+  }
+
+  // Skips the change-detector's next pass right after a load/finalize, so
+  // restoring saved data isn't mistaken for an edit that should unfinalize the day.
+  const justLoadedRef  = useRef(true);
+  const baselineSigRef = useRef('');
+  const autoSaveTimerRef = useRef(null);
+  // True once the day on screen has its saved copy loaded (or is known not to
+  // have one). Nothing may be auto-saved before then — see the change watcher.
+  const loadedRef      = useRef(false);
+  // Whether the change watcher's previous pass had real data to compare against.
+  const wasReadyRef    = useRef(false);
+
+  // The version of the day this editor loaded. Every save sends it, and the
+  // server refuses the write if the day has moved on since — otherwise a second
+  // tab (or a second manager) editing the same date would silently overwrite
+  // everything done here, because a save replaces the whole day rather than
+  // merging. Held in a ref so the debounced auto-save always reads the current
+  // value rather than one captured when the timer was set.
+  const versionRef = useRef(0);
+  // { by, at } of whoever saved this day first; false when there's no conflict.
+  const [conflict, setConflict] = useState(false);
+  // Who last edited / finalized the day on screen, as the server stamped it.
+  const [stamp, setStamp] = useState(null);
+
+  // The date currently on screen. Unlike the effect closures this is always
+  // up to date, which is what lets a save that resolves after the manager has
+  // navigated tell whether its result still applies to what they're looking at.
+  const currentDateStrRef = useRef(dateStr);
+  useEffect(() => { currentDateStrRef.current = dateStr; }, [dateStr]);
+
+  // What the debounced save is going to write, kept alongside the timer so the
+  // same payload can be flushed early if the day changes first.
+  const pendingSaveRef = useRef(null);
+
+  // A conflict isn't recoverable by retrying: this editor's copy of the day is
+  // stale, so every subsequent save would fail the same way. Say so once and stop.
+  function handleSaveError(err) {
+    if (isConflict(err)) setConflict({ by: err.lastEditedBy ?? null, at: err.lastEditedAt ?? null });
+    else console.warn('Schedule save failed:', err.message);
+  }
+
+  // One place every auto-save goes through. The version is passed in rather than
+  // read here, because the two callers disagree about which one is right: the
+  // debounce wants the newest (a save may have completed since it was queued),
+  // while the flush-on-leave wants the one belonging to the day being left.
+  //
+  // Both guards below exist because this can resolve after the manager has moved
+  // to another day. Adopting the version then would stamp the old day's number
+  // onto the new day's editor, and raising the conflict banner would blame the
+  // day on screen for a failure that belongs to one they've already left.
+  function writeDay({ dateStr: forDate, staff, events }, expectedVersion) {
+    return schedulesApi
+      .saveDay(forDate, { staff, events, finalized: false, expectedVersion })
+      .then(saved => {
+        if (currentDateStrRef.current === forDate) {
+          versionRef.current = saved.version ?? expectedVersion + 1;
+          setStamp(editStampOf(saved));
+        }
+      })
+      .catch(err => {
+        if (currentDateStrRef.current === forDate) handleSaveError(err);
+        else console.warn(`Auto-save for ${forDate} failed after navigating away:`, err.message);
+      });
+  }
+
+  useEffect(() => {
+    const dateStr = toDateStr(schedule.currentDate);
+
+    // Until this lands, what's on screen is the previous day or a placeholder.
+    // Any save queued from it now would write that onto this date, so drop it.
+    // (A real edit to the day being left was already flushed by the cleanup below.)
+    loadedRef.current = false;
+    clearTimeout(autoSaveTimerRef.current);
+    autoSaveTimerRef.current = null;
+    pendingSaveRef.current = null;
+
+    schedulesApi.getDay(dateStr)
+      .then(saved => {
+        // Saved schedule found in DB — restore shift/desk overrides, but merge them onto
+        // the live staff roster so staff added/removed/edited since this was saved are
+        // reflected correctly, respecting the finalized flag (older docs saved before
+        // this field existed default to finalized). Events are never restored from the
+        // snapshot — they're always derived live (see todayEvents).
+        // Sorted on load, the same way the weekly editor does it. A saved array
+        // keeps whatever order it was written in, and approving a drop/cover
+        // clears someone's shifts without reordering — so without this they'd
+        // stay stranded mid-list instead of sinking to the unscheduled group.
+        setOrderedStaff(sortByShift(mergeStaffOverrides(schedule.staff, saved.staff).map(normalizeStaff)));
+        setFinalized(saved.finalized ?? true);
+        versionRef.current = saved.version ?? 0;
+        setStamp(editStampOf(saved));
+        setConflict(false);
+        justLoadedRef.current = true;
+        loadedRef.current = true;
+      })
+      .catch(() => {
+        // 404 or backend unreachable — fall back to whatever is in memory. With
+        // neither, the day is genuinely unscheduled; it used to fall back to the
+        // hardcoded weeklyTemplates seed, which showed invented shifts for real
+        // people on a day nobody had ever been scheduled.
+        const inMemory = schedule.getDaySchedule(schedule.currentDate.toDateString());
+        if (inMemory) {
+          setOrderedStaff(sortByShift(mergeStaffOverrides(schedule.staff, inMemory).map(normalizeStaff)));
+        } else {
+          setOrderedStaff(sortByShift(schedule.staff.map(s => normalizeStaff({ ...s, scheduled: false }))));
+        }
+        // No saved row for this day yet — version 0 means "expect it absent".
+        versionRef.current = 0;
+        setStamp(null);
+        setConflict(false);
+        setFinalized(true);
+        justLoadedRef.current = true;
+        loadedRef.current = true;
+      });
+  }, [schedule.currentDate.toDateString(), schedule.staff]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-unfinalize: any real edit to staff/events while finalized flips the day
+  // back to a draft and persists it, so a refresh doesn't silently revert to "finalized".
+  useEffect(() => {
+    const sig = JSON.stringify({ staff: orderedStaff, events: todayEvents });
+    // Only a change made on top of real data is an edit. Until both this day's
+    // saved copy and the events list have loaded, whatever changes on screen is
+    // the page filling in, so it becomes the baseline instead of being saved.
+    //
+    // This used to wipe days. The events list landing first, or the date
+    // changing under the previous day's rows, looked like an edit and queued a
+    // save of what was on screen; the day's own fetch then landed in time to
+    // hand that save a valid version, and the server accepted it — writing an
+    // empty day, or the previous day's schedule, over the real one.
+    const ready = loadedRef.current && schedule.eventsLoaded;
+    if (!ready || justLoadedRef.current || !wasReadyRef.current) {
+      wasReadyRef.current = ready;
+      justLoadedRef.current = false;
+      baselineSigRef.current = sig;
+      return;
+    }
+    if (sig === baselineSigRef.current) return;
+    baselineSigRef.current = sig;
+
+    if (finalized) setFinalized(false);
+
+    // Recorded before the timer so that leaving the day can write exactly what
+    // this edit would have written, rather than losing it.
+    pendingSaveRef.current = { dateStr, staff: staffForSave(), events: todayEvents };
+
+    clearTimeout(autoSaveTimerRef.current);
+    autoSaveTimerRef.current = setTimeout(() => {
+      autoSaveTimerRef.current = null;
+      const pending = pendingSaveRef.current;
+      pendingSaveRef.current = null;
+      // Read the version now, not when the timer was set: a save that completed
+      // in the meantime has already advanced it.
+      if (pending) writeDay(pending, versionRef.current);
+    }, 600);
+  }, [orderedStaff, todayEvents, schedule.eventsLoaded]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Leaving the day with an edit still inside the debounce window.
+  //
+  // The timer used to simply survive: it fired after the next day had loaded and
+  // read `versionRef` then, so it wrote the old day's staff carrying the new
+  // day's version. The server rejected that, the edit was gone, and the conflict
+  // banner appeared over a day that was never the problem. Whichever way it
+  // landed, the last thing the manager did before clicking the arrow was lost.
+  //
+  // The edit was real, so it gets written now instead. `versionRef` still holds
+  // the departing day's version here — the incoming day's fetch is in flight and
+  // only overwrites it on resolve, long after this cleanup has run.
+  useEffect(() => () => {
+    if (!autoSaveTimerRef.current) return;
+    clearTimeout(autoSaveTimerRef.current);
+    autoSaveTimerRef.current = null;
+    const pending = pendingSaveRef.current;
+    pendingSaveRef.current = null;
+    if (pending) writeDay(pending, versionRef.current);
+  }, [dateStr]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Being assigned to an event means being scheduled to work it, so shifts are
+  // widened to cover assigned events on the way out. Dragging an event onto a
+  // row already does this; enforcing it at every save is what covers the paths
+  // that have no drag — above all repeating events, whose assignedStaff list is
+  // shared by every occurrence and so never gets dropped onto a later day's row.
+  function staffForSave() {
+    // Merge after stretching: widening a shift to cover an event can leave it
+    // butted against the next one, which is then the same continuous stretch
+    // described twice.
+    return mergeStaffShifts(stretchShiftsToCoverEvents(orderedStaff, todayEvents));
+  }
+
+  function handlePrevDay() {
+    schedule.saveDaySchedule(schedule.currentDate.toDateString(), staffForSave());
+    schedule.goToPrevDay();
+  }
+
+  function handleNextDay() {
+    schedule.saveDaySchedule(schedule.currentDate.toDateString(), staffForSave());
+    schedule.goToNextDay();
+  }
+
+  function endDrag() {
+    setActiveDragType(null);
+    setDraggingEventId(null);
+    setHoverRow(null);
+    setPreviewInfo(null);
+  }
+
+  // ── Toolbar chip drag-over: track cursor to show placement preview ───────────
+  function handleTimelineDragOver(e, rowIndex) {
+    setHoverRow(rowIndex);
+    // Guard list has to name every draggable type — a type missing here reaches
+    // no branch below, so the chip drags with no placement preview at all.
+    if (activeDragType !== 'shift' && activeDragType !== 'desk'
+        && activeDragType !== 'vr' && activeDragType !== 'oneOnOne'
+        && activeDragType !== 'event') return;
+    const rect = getRowRect(e, rowIndex);
+    const rawHours = HOURS_START + ((e.clientX - rect.left) / rect.width) * TOTAL_HOURS;
+    const person = orderedStaff[rowIndex];
+
+    if (activeDragType === 'shift') {
+      const duration = 2;
+      const start = snapHalf(clamp(rawHours - duration / 2, HOURS_START, HOURS_END - duration));
+      const end = start + duration;
+      const valid = !person.shifts.some(s => start < s.end && end > s.start);
+      setPreviewInfo({ staffIndex: rowIndex, start, end, valid });
+    } else if (activeDragType === 'desk') {
+      const duration = 1;
+      const host = person.shifts.find(sh => rawHours >= sh.start && rawHours <= sh.end);
+      if (!host) {
+        setPreviewInfo({ staffIndex: rowIndex, start: null, end: null, valid: false });
+        return;
+      }
+      const start = snapHalf(clamp(rawHours - duration / 2, host.start, host.end - duration));
+      const end = start + duration;
+      const personEvents = todayEvents.filter(ev => ev.assignedStaff.includes(person.id));
+      const valid = !person.deskShifts.some(d => start < d.end && end > d.start) &&
+                    !(person.oneOnOnes ?? []).some(o => start < o.end && end > o.start) &&
+                    !personEvents.some(ev => start < ev.end && end > ev.start);
+      setPreviewInfo({ staffIndex: rowIndex, start, end, valid });
+    } else if (activeDragType === 'vr') {
+      const duration = 1;
+      const host = person.shifts.find(sh => rawHours >= sh.start && rawHours <= sh.end);
+      if (!host) {
+        setPreviewInfo({ staffIndex: rowIndex, start: null, end: null, valid: false });
+        return;
+      }
+      const start = snapHalf(clamp(rawHours - duration / 2, host.start, host.end - duration));
+      const end = start + duration;
+      const personEvents = todayEvents.filter(ev => ev.assignedStaff.includes(person.id));
+      // Desk counts as a conflict as well as other VR turns: separate rooms, so
+      // one person cannot hold both at the same time.
+      const valid = !person.vrShifts.some(v => start < v.end && end > v.start) &&
+                    !person.deskShifts.some(d => start < d.end && end > d.start) &&
+                    !(person.oneOnOnes ?? []).some(o => start < o.end && end > o.start) &&
+                    !personEvents.some(ev => start < ev.end && end > ev.start);
+      setPreviewInfo({ staffIndex: rowIndex, start, end, valid });
+    } else if (activeDragType === 'oneOnOne') {
+      // Inside a host shift like any duty. Unlike desk and VR there is no
+      // cross-person check: two people can be in separate 1-1s at the same time.
+      // The conflict set is only this person's other in-band bars, which exists
+      // to stop the bars drawing on top of each other.
+      const duration = 1;
+      const host = person.shifts.find(sh => rawHours >= sh.start && rawHours <= sh.end);
+      if (!host) {
+        setPreviewInfo({ staffIndex: rowIndex, start: null, end: null, valid: false });
+        return;
+      }
+      const start = snapHalf(clamp(rawHours - duration / 2, host.start, host.end - duration));
+      const end = start + duration;
+      const personEvents = todayEvents.filter(ev => ev.assignedStaff.includes(person.id));
+      const valid = !(person.oneOnOnes ?? []).some(o => start < o.end && end > o.start) &&
+                    !person.deskShifts.some(d => start < d.end && end > d.start) &&
+                    !vrOf(person).some(v => start < v.end && end > v.start) &&
+                    !personEvents.some(ev => start < ev.end && end > ev.start);
+      setPreviewInfo({ staffIndex: rowIndex, start, end, valid });
+    } else if (activeDragType === 'event' && draggingEventId !== null) {
+      const evt = todayEvents.find(ev => ev.id === draggingEventId);
+      if (!evt) return;
+      const alreadyAssigned  = evt.assignedStaff.includes(person.id);
+      const hasDeskConflict  = person.deskShifts?.some(d => d.start < evt.end && d.end > evt.start);
+      const hasEventConflict = todayEvents.some(other =>
+        other.id !== evt.id &&
+        other.assignedStaff.includes(person.id) &&
+        other.start < evt.end && other.end > evt.start
+      );
+      setPreviewInfo({ staffIndex: rowIndex, start: evt.start, end: evt.end, valid: !alreadyAssigned && !hasDeskConflict && !hasEventConflict });
+    }
+  }
+
+  // ── Shift bar resize (mouse events only) ─────────────────────────────────────
+  function handleBarMouseDown(e, staffIndex, shiftIndex, mode) {
+    const timelineEl = e.currentTarget.closest('[data-timeline]');
+    const { width: timelineWidth } = timelineEl.getBoundingClientRect();
+    const startX          = e.clientX;
+    const shift0          = orderedStaff[staffIndex].shifts[shiftIndex];
+    const initialStart    = shift0.start;
+    const initialEnd      = shift0.end;
+    const otherShifts     = orderedStaff[staffIndex].shifts.filter((_, j) => j !== shiftIndex);
+
+    shiftDragActiveRef.current = true;
+    setActiveBar({ type: 'shift', staffIndex, shiftIndex, mode });
+    document.body.style.cursor     = 'ew-resize';
+    document.body.style.userSelect = 'none';
+
+    function onMove(me) {
+      const delta = ((me.clientX - startX) / timelineWidth) * TOTAL_HOURS;
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const p = { ...next[staffIndex], shifts: [...next[staffIndex].shifts] };
+        const s = { ...p.shifts[shiftIndex] };
+        if (mode === 'left')  s.start = snapHalf(clamp(initialStart + delta, HOURS_START, initialEnd - 0.5));
+        else                   s.end   = snapHalf(clamp(initialEnd   + delta, initialStart + 0.5, HOURS_END));
+        if (!otherShifts.some(os => s.start < os.end && s.end > os.start)) p.shifts[shiftIndex] = s;
+        next[staffIndex] = p;
+        return next;
+      });
+    }
+    function onUp() {
+      shiftDragActiveRef.current = false;
+      setActiveBar(null);
+      document.body.style.cursor = document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      // Desk/VR/1-1 time the shift no longer covers goes with it.
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        next[staffIndex] = sweepDutiesAfterResize(next[staffIndex], { start: initialStart, end: initialEnd });
+        return sortByShift(next);
+      });
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
+
+  // ── Desk bar resize (mouse events only) ──────────────────────────────────────
+  function handleDeskBarMouseDown(e, staffIndex, deskIndex, mode) {
+    const timelineEl = e.currentTarget.closest('[data-timeline]');
+    const { width: timelineWidth } = timelineEl.getBoundingClientRect();
+    const startX       = e.clientX;
+    const desk0        = orderedStaff[staffIndex].deskShifts[deskIndex];
+    const initialStart = desk0.start;
+    const initialEnd   = desk0.end;
+    const otherDesks   = orderedStaff[staffIndex].deskShifts.filter((_, j) => j !== deskIndex);
+    const personEvents = todayEvents.filter(ev => ev.assignedStaff.includes(orderedStaff[staffIndex].id));
+    // Bounds come from the shift this turn belongs to. Falling back to the whole
+    // studio day when none contains it let an already-stranded turn roam further.
+    const { lo: shiftLo, hi: shiftHi } = deskBoundsFor(orderedStaff[staffIndex], desk0);
+
+    setActiveBar({ type: 'desk', staffIndex, deskIndex, mode });
+    document.body.style.cursor     = 'ew-resize';
+    document.body.style.userSelect = 'none';
+
+    function onMove(me) {
+      const delta = ((me.clientX - startX) / timelineWidth) * TOTAL_HOURS;
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const p = { ...next[staffIndex], deskShifts: [...next[staffIndex].deskShifts] };
+        const d = { ...p.deskShifts[deskIndex] };
+        if (mode === 'left')  d.start = snapHalf(clamp(initialStart + delta, shiftLo, initialEnd - 0.5));
+        else                   d.end   = snapHalf(clamp(initialEnd   + delta, initialStart + 0.5, shiftHi));
+        if (!otherDesks.some(od => d.start < od.end && d.end > od.start) &&
+            !personEvents.some(ev => d.start < ev.end && d.end > ev.start)) p.deskShifts[deskIndex] = d;
+        next[staffIndex] = p;
+        return next;
+      });
+    }
+    function onUp() {
+      setActiveBar(null);
+      document.body.style.cursor = document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
+
+  // ── Event bar resize (mouse events only) ─────────────────────────────────────
+  function handleEventBarMouseDown(e, eventId, mode) {
+    const timelineEl = e.currentTarget.closest('[data-timeline]');
+    const { width: timelineWidth } = timelineEl.getBoundingClientRect();
+    const startX       = e.clientX;
+    const evt          = schedule.events.find(ev => ev.id === eventId);
+    const initialStart = evt.start;
+    const initialEnd   = evt.end;
+    const updateEvent  = schedule.updateEvent;
+
+    setActiveBar({ type: 'event', eventId, mode });
+    document.body.style.cursor     = 'ew-resize';
+    document.body.style.userSelect = 'none';
+
+    function onMove(me) {
+      const delta = ((me.clientX - startX) / timelineWidth) * TOTAL_HOURS;
+      if (mode === 'left') updateEvent(eventId, { start: snapHalf(clamp(initialStart + delta, HOURS_START, initialEnd - 0.5)) });
+      else                  updateEvent(eventId, { end:   snapHalf(clamp(initialEnd   + delta, initialStart + 0.5, HOURS_END)) });
+    }
+    function onUp() {
+      setActiveBar(null);
+      document.body.style.cursor = document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
+
+  // ── Bar HTML5 drag — move + trash ────────────────────────────────────────────
+  function handleShiftBarDragStart(e, staffIndex, shiftIndex) {
+    e.dataTransfer.effectAllowed = 'move';
+    const person = orderedStaff[staffIndex];
+    const shift = person.shifts[shiftIndex];
+    shiftDragActiveRef.current = true;
+    setDraggingBarInfo({ type: 'shift', staffIndex, shiftIndex, shiftId: shift.id, personId: person.id, duration: shift.end - shift.start, originalStart: shift.start, originalEnd: shift.end });
+  }
+
+  // ── VR bar resize (mouse events only) ────────────────────────────────────────
+  // Mirrors handleDeskBarMouseDown exactly. The two stay separate rather than
+  // sharing a parameterised helper because each closes over its own array and
+  // conflict set; folding them together obscured which post was being moved.
+  function handleVrBarMouseDown(e, staffIndex, vrIndex, mode) {
+    const timelineEl = e.currentTarget.closest('[data-timeline]');
+    const { width: timelineWidth } = timelineEl.getBoundingClientRect();
+    const startX       = e.clientX;
+    const vr0          = orderedStaff[staffIndex].vrShifts[vrIndex];
+    const initialStart = vr0.start;
+    const initialEnd   = vr0.end;
+    const otherVrs     = orderedStaff[staffIndex].vrShifts.filter((_, j) => j !== vrIndex);
+    const personEvents = todayEvents.filter(ev => ev.assignedStaff.includes(orderedStaff[staffIndex].id));
+    // Bounds come from the shift this turn belongs to, same as desk.
+    const { lo: shiftLo, hi: shiftHi } = vrBoundsFor(orderedStaff[staffIndex], vr0);
+
+    setActiveBar({ type: 'vr', staffIndex, vrIndex, mode });
+    document.body.style.cursor     = 'ew-resize';
+    document.body.style.userSelect = 'none';
+
+    function onMove(me) {
+      const delta = ((me.clientX - startX) / timelineWidth) * TOTAL_HOURS;
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const p = { ...next[staffIndex], vrShifts: [...next[staffIndex].vrShifts] };
+        const v = { ...p.vrShifts[vrIndex] };
+        if (mode === 'left')  v.start = snapHalf(clamp(initialStart + delta, shiftLo, initialEnd - 0.5));
+        else                  v.end   = snapHalf(clamp(initialEnd   + delta, initialStart + 0.5, shiftHi));
+        if (!otherVrs.some(ov => v.start < ov.end && v.end > ov.start) &&
+            !personEvents.some(ev => v.start < ev.end && v.end > ev.start)) p.vrShifts[vrIndex] = v;
+        next[staffIndex] = p;
+        return next;
+      });
+    }
+    function onUp() {
+      setActiveBar(null);
+      document.body.style.cursor = document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
+
+  function handleVrBarDragStart(e, staffIndex, vrIndex) {
+    e.dataTransfer.effectAllowed = 'move';
+    const vr = orderedStaff[staffIndex].vrShifts[vrIndex];
+    setDraggingBarInfo({ type: 'vr', staffIndex, vrIndex, vrId: vr.id, duration: vr.end - vr.start, originalStart: vr.start, originalEnd: vr.end });
+  }
+
+  // ── 1-1 bar resize (mouse events only) ───────────────────────────────────────
+  // Same shape as the desk and VR handlers above: bounds from the host shift, and
+  // a conflict set of everything else in the row's in-shift band. The text fields
+  // are untouched by a resize, so they ride along on the spread.
+  function handleOneOnOneBarMouseDown(e, staffIndex, oneOnOneIndex, mode) {
+    const timelineEl = e.currentTarget.closest('[data-timeline]');
+    const { width: timelineWidth } = timelineEl.getBoundingClientRect();
+    const startX       = e.clientX;
+    const person0      = orderedStaff[staffIndex];
+    const ooo0         = person0.oneOnOnes[oneOnOneIndex];
+    const initialStart = ooo0.start;
+    const initialEnd   = ooo0.end;
+    const otherOoos    = person0.oneOnOnes.filter((_, j) => j !== oneOnOneIndex);
+    const personEvents = todayEvents.filter(ev => ev.assignedStaff.includes(person0.id));
+    const otherDuties  = [...(person0.deskShifts ?? []), ...vrOf(person0)];
+    const { lo: shiftLo, hi: shiftHi } = dutyBoundsFor(person0, ooo0);
+
+    setActiveBar({ type: 'oneOnOne', staffIndex, oneOnOneIndex, mode });
+    document.body.style.cursor     = 'ew-resize';
+    document.body.style.userSelect = 'none';
+
+    function onMove(me) {
+      const delta = ((me.clientX - startX) / timelineWidth) * TOTAL_HOURS;
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const p = { ...next[staffIndex], oneOnOnes: [...next[staffIndex].oneOnOnes] };
+        const o = { ...p.oneOnOnes[oneOnOneIndex] };
+        if (mode === 'left')  o.start = snapHalf(clamp(initialStart + delta, shiftLo, initialEnd - 0.5));
+        else                  o.end   = snapHalf(clamp(initialEnd   + delta, initialStart + 0.5, shiftHi));
+        if (!otherOoos.some(oo => o.start < oo.end && o.end > oo.start) &&
+            !otherDuties.some(d => o.start < d.end && o.end > d.start) &&
+            !personEvents.some(ev => o.start < ev.end && o.end > ev.start)) p.oneOnOnes[oneOnOneIndex] = o;
+        next[staffIndex] = p;
+        return next;
+      });
+    }
+    function onUp() {
+      setActiveBar(null);
+      document.body.style.cursor = document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
+
+  function handleOneOnOneBarDragStart(e, staffIndex, oneOnOneIndex) {
+    e.dataTransfer.effectAllowed = 'move';
+    const ooo = orderedStaff[staffIndex].oneOnOnes[oneOnOneIndex];
+    setDraggingBarInfo({ type: 'oneOnOne', staffIndex, oneOnOneIndex, oneOnOneId: ooo.id, duration: ooo.end - ooo.start, originalStart: ooo.start, originalEnd: ooo.end });
+  }
+
+  function handleDeskBarDragStart(e, staffIndex, deskIndex) {
+    e.dataTransfer.effectAllowed = 'move';
+    const desk = orderedStaff[staffIndex].deskShifts[deskIndex];
+    setDraggingBarInfo({ type: 'desk', staffIndex, deskIndex, deskId: desk.id, duration: desk.end - desk.start, originalStart: desk.start, originalEnd: desk.end });
+  }
+
+  function handleEventBarDragStart(e, eventId, staffId) {
+    e.dataTransfer.effectAllowed = 'move';
+    const evt = schedule.events.find(ev => ev.id === eventId);
+    setDraggingBarInfo({ type: 'event', eventId, staffId, duration: evt.end - evt.start });
+  }
+
+  function handleBarDragEnd() {
+    shiftDragActiveRef.current = false;
+    setPreviewInfo(null);
+    setDraggingBarInfo(null);
+    setOrderedStaff(prev => sortByShift(prev));
+  }
+
+  // ── Bar right-click context menu ─────────────────────────────────────────────
+  function handleBarContextMenu(e, target) {
+    setContextMenu({ x: e.clientX, y: e.clientY, target });
+  }
+
+  function handleContextMenuDelete() {
+    const { target } = contextMenu;
+    setContextMenu(null);
+    if (target.type === 'shift') {
+      // Sweeps the same way the trash does — deleting a shift from the menu used
+      // to leave its desk/VR/1-1 bars and event assignments stranded on the row.
+      const person = orderedStaff[target.staffIndex];
+      const { person: swept, events } = removeShiftAndSweep(
+        person,
+        target.shiftIndex,
+        todayEvents.filter(ev => ev.assignedStaff.includes(person.id)),
+      );
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        next[target.staffIndex] = swept;
+        return sortByShift(next);
+      });
+      events.forEach(ev => schedule.unassignStaffFromEvent(ev.id, person.id));
+    } else if (target.type === 'desk') {
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const p = { ...next[target.staffIndex] };
+        p.deskShifts = p.deskShifts.filter((_, j) => j !== target.deskIndex);
+        next[target.staffIndex] = p;
+        return next;
+      });
+    } else if (target.type === 'vr') {
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const p = { ...next[target.staffIndex] };
+        p.vrShifts = p.vrShifts.filter((_, j) => j !== target.vrIndex);
+        next[target.staffIndex] = p;
+        return next;
+      });
+    } else if (target.type === 'oneOnOne') {
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const p = { ...next[target.staffIndex] };
+        p.oneOnOnes = (p.oneOnOnes ?? []).filter((_, j) => j !== target.oneOnOneIndex);
+        next[target.staffIndex] = p;
+        return next;
+      });
+    } else if (target.type === 'event') {
+      schedule.unassignStaffFromEvent(target.eventId, target.staffId);
+    }
+  }
+
+  function handleContextMenuEdit() {
+    setEditModal(contextMenu.target);
+    setContextMenu(null);
+  }
+
+  function handleEditSave(data) {
+    const t = editModal;
+    setEditModal(null);
+    if (t.type === 'shift' && t.isNew) {
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const p = next[t.staffIndex];
+        next[t.staffIndex] = {
+          ...p, scheduled: true,
+          shifts: [...(p.shifts ?? []), { id: `s${Date.now()}`, start: data.shiftStart, end: data.shiftEnd }],
+        };
+        return sortByShift(next);
+      });
+    } else if (t.type === 'shift') {
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const p = { ...next[t.staffIndex], shifts: [...next[t.staffIndex].shifts] };
+        const before = p.shifts[t.shiftIndex];
+        p.shifts[t.shiftIndex] = { ...before, start: data.shiftStart, end: data.shiftEnd };
+        next[t.staffIndex] = sweepDutiesAfterResize(p, before);
+        return sortByShift(next);
+      });
+    } else if (t.type === 'desk') {
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const p = { ...next[t.staffIndex], deskShifts: [...next[t.staffIndex].deskShifts] };
+        p.deskShifts[t.deskIndex] = { ...p.deskShifts[t.deskIndex], start: data.deskStart, end: data.deskEnd };
+        next[t.staffIndex] = p;
+        return next;
+      });
+    } else if (t.type === 'vr') {
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const p = { ...next[t.staffIndex], vrShifts: [...next[t.staffIndex].vrShifts] };
+        p.vrShifts[t.vrIndex] = { ...p.vrShifts[t.vrIndex], start: data.vrStart, end: data.vrEnd };
+        next[t.staffIndex] = p;
+        return next;
+      });
+    } else if (t.type === 'oneOnOne') {
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const p = { ...next[t.staffIndex], oneOnOnes: [...next[t.staffIndex].oneOnOnes] };
+        p.oneOnOnes[t.oneOnOneIndex] = {
+          ...p.oneOnOnes[t.oneOnOneIndex],
+          kind: data.oooKind.trim(), withWhom: data.oooWith.trim(),
+          start: data.oooStart, end: data.oooEnd,
+        };
+        next[t.staffIndex] = p;
+        return next;
+      });
+    } else if (t.type === 'event') {
+      schedule.updateEvent(t.eventId, { name: data.name, type: data.type, start: data.start, end: data.end, staffNeeded: data.staffNeeded, notes: data.notes, repeating: data.repeating, repeatFrom: data.repeatFrom, repeatUntil: data.repeatUntil });
+    }
+  }
+
+  // Live repositioning (same row) or ghost preview (cross-row) while dragging a bar
+  function handleBarDragOver(e, rowIndex) {
+    if (!draggingBarInfo) return;
+    const rect = getRowRect(e, rowIndex);
+    const rawHours = HOURS_START + ((e.clientX - rect.left) / rect.width) * TOTAL_HOURS;
+    const { type, staffIndex, shiftIndex, deskIndex, vrIndex, oneOnOneIndex, eventId, duration } = draggingBarInfo;
+    const sameRow = staffIndex === rowIndex;
+
+    if (type === 'shift') {
+      const newStart = snapHalf(clamp(rawHours - duration / 2, HOURS_START, HOURS_END - duration));
+      const newEnd   = newStart + duration;
+      if (sameRow) {
+        setPreviewInfo(null);
+        setOrderedStaff(prev => {
+          const next = [...prev];
+          const p = { ...next[staffIndex], shifts: [...next[staffIndex].shifts] };
+          const otherShifts = p.shifts.filter((_, j) => j !== shiftIndex);
+          if (!otherShifts.some(os => newStart < os.end && newEnd > os.start)) {
+            p.shifts[shiftIndex] = { ...p.shifts[shiftIndex], start: newStart, end: newEnd };
+          }
+          next[staffIndex] = p;
+          return next;
+        });
+      } else {
+        const target = orderedStaff[rowIndex];
+        const valid  = !target.shifts.some(s => newStart < s.end && newEnd > s.start);
+        setPreviewInfo({ staffIndex: rowIndex, start: newStart, end: newEnd, valid });
+      }
+
+    } else if (type === 'desk') {
+      if (sameRow) {
+        setPreviewInfo(null);
+        setOrderedStaff(prev => {
+          const next = [...prev];
+          const p = { ...next[staffIndex], deskShifts: [...next[staffIndex].deskShifts] };
+          const host = p.shifts.find(sh => rawHours >= sh.start && rawHours <= sh.end);
+          if (!host) return prev;
+          const newStart   = snapHalf(clamp(rawHours - duration / 2, host.start, host.end - duration));
+          const newEnd     = newStart + duration;
+          const otherDesks = p.deskShifts.filter((_, j) => j !== deskIndex);
+          const personEvts = todayEvents.filter(ev => ev.assignedStaff.includes(p.id));
+          if (!otherDesks.some(od => newStart < od.end && newEnd > od.start) &&
+              !personEvts.some(ev => newStart < ev.end && newEnd > ev.start)) {
+            p.deskShifts[deskIndex] = { ...p.deskShifts[deskIndex], start: newStart, end: newEnd };
+          }
+          next[staffIndex] = p;
+          return next;
+        });
+      } else {
+        const target = orderedStaff[rowIndex];
+        const host   = target.shifts.find(sh => rawHours >= sh.start && rawHours <= sh.end);
+        if (!host) {
+          setPreviewInfo({ staffIndex: rowIndex, start: null, end: null, valid: false });
+          return;
+        }
+        const newStart   = snapHalf(clamp(rawHours - duration / 2, host.start, host.end - duration));
+        const newEnd     = newStart + duration;
+        const targetEvts = todayEvents.filter(ev => ev.assignedStaff.includes(target.id));
+        const valid      = !target.deskShifts.some(d => newStart < d.end && newEnd > d.start) &&
+                           !targetEvts.some(ev => newStart < ev.end && newEnd > ev.start);
+        setPreviewInfo({ staffIndex: rowIndex, start: newStart, end: newEnd, valid });
+      }
+
+    } else if (type === 'vr') {
+      if (sameRow) {
+        setPreviewInfo(null);
+        setOrderedStaff(prev => {
+          const next = [...prev];
+          const p = { ...next[staffIndex], vrShifts: [...next[staffIndex].vrShifts] };
+          const host = p.shifts.find(sh => rawHours >= sh.start && rawHours <= sh.end);
+          if (!host) return prev;
+          const newStart   = snapHalf(clamp(rawHours - duration / 2, host.start, host.end - duration));
+          const newEnd     = newStart + duration;
+          const otherVrs   = p.vrShifts.filter((_, j) => j !== vrIndex);
+          const personEvts = todayEvents.filter(ev => ev.assignedStaff.includes(p.id));
+          if (!otherVrs.some(ov => newStart < ov.end && newEnd > ov.start) &&
+              !p.deskShifts.some(d => newStart < d.end && newEnd > d.start) &&
+              !personEvts.some(ev => newStart < ev.end && newEnd > ev.start)) {
+            p.vrShifts[vrIndex] = { ...p.vrShifts[vrIndex], start: newStart, end: newEnd };
+          }
+          next[staffIndex] = p;
+          return next;
+        });
+      } else {
+        const target = orderedStaff[rowIndex];
+        const host   = target.shifts.find(sh => rawHours >= sh.start && rawHours <= sh.end);
+        if (!host) {
+          setPreviewInfo({ staffIndex: rowIndex, start: null, end: null, valid: false });
+          return;
+        }
+        const newStart   = snapHalf(clamp(rawHours - duration / 2, host.start, host.end - duration));
+        const newEnd     = newStart + duration;
+        const targetEvts = todayEvents.filter(ev => ev.assignedStaff.includes(target.id));
+        const valid      = !target.vrShifts.some(v => newStart < v.end && newEnd > v.start) &&
+                           !target.deskShifts.some(d => newStart < d.end && newEnd > d.start) &&
+                           !(target.oneOnOnes ?? []).some(o => newStart < o.end && newEnd > o.start) &&
+                           !targetEvts.some(ev => newStart < ev.end && newEnd > ev.start);
+        setPreviewInfo({ staffIndex: rowIndex, start: newStart, end: newEnd, valid });
+      }
+
+    } else if (type === 'oneOnOne') {
+      if (sameRow) {
+        setPreviewInfo(null);
+        setOrderedStaff(prev => {
+          const next = [...prev];
+          const p = { ...next[staffIndex], oneOnOnes: [...next[staffIndex].oneOnOnes] };
+          const host = p.shifts.find(sh => rawHours >= sh.start && rawHours <= sh.end);
+          if (!host) return prev;
+          const newStart   = snapHalf(clamp(rawHours - duration / 2, host.start, host.end - duration));
+          const newEnd     = newStart + duration;
+          const otherOoos  = p.oneOnOnes.filter((_, j) => j !== oneOnOneIndex);
+          const personEvts = todayEvents.filter(ev => ev.assignedStaff.includes(p.id));
+          if (!otherOoos.some(oo => newStart < oo.end && newEnd > oo.start) &&
+              !(p.deskShifts ?? []).some(d => newStart < d.end && newEnd > d.start) &&
+              !vrOf(p).some(v => newStart < v.end && newEnd > v.start) &&
+              !personEvts.some(ev => newStart < ev.end && newEnd > ev.start)) {
+            p.oneOnOnes[oneOnOneIndex] = { ...p.oneOnOnes[oneOnOneIndex], start: newStart, end: newEnd };
+          }
+          next[staffIndex] = p;
+          return next;
+        });
+      } else {
+        const target = orderedStaff[rowIndex];
+        const host   = target.shifts.find(sh => rawHours >= sh.start && rawHours <= sh.end);
+        if (!host) {
+          setPreviewInfo({ staffIndex: rowIndex, start: null, end: null, valid: false });
+          return;
+        }
+        const newStart   = snapHalf(clamp(rawHours - duration / 2, host.start, host.end - duration));
+        const newEnd     = newStart + duration;
+        const targetEvts = todayEvents.filter(ev => ev.assignedStaff.includes(target.id));
+        const valid      = !(target.oneOnOnes ?? []).some(o => newStart < o.end && newEnd > o.start) &&
+                           !target.deskShifts.some(d => newStart < d.end && newEnd > d.start) &&
+                           !vrOf(target).some(v => newStart < v.end && newEnd > v.start) &&
+                           !targetEvts.some(ev => newStart < ev.end && newEnd > ev.start);
+        setPreviewInfo({ staffIndex: rowIndex, start: newStart, end: newEnd, valid });
+      }
+
+    } else if (type === 'event') {
+      if (!sameRow) {
+        const evt    = todayEvents.find(ev => ev.id === eventId);
+        if (!evt) return;
+        const target = orderedStaff[rowIndex];
+        const alreadyAssigned  = evt.assignedStaff.includes(target.id);
+        const hasDeskConflict  = target.deskShifts?.some(d => d.start < evt.end && d.end > evt.start);
+        const hasEventConflict = todayEvents.some(other =>
+          other.id !== evt.id &&
+          other.assignedStaff.includes(target.id) &&
+          other.start < evt.end && other.end > evt.start
+        );
+        setPreviewInfo({ staffIndex: rowIndex, start: evt.start, end: evt.end, valid: !alreadyAssigned && !hasDeskConflict && !hasEventConflict });
+      }
+    }
+  }
+
+  function handleBarDrop(e, rowIndex) {
+    if (!draggingBarInfo) return;
+    const { type, staffIndex, shiftIndex, deskIndex, vrIndex, oneOnOneIndex, eventId, staffId } = draggingBarInfo;
+    if (staffIndex === rowIndex) return; // same-row position already settled via dragover
+    if (!previewInfo || previewInfo.staffIndex !== rowIndex || !previewInfo.valid || previewInfo.start === null) return;
+
+    setPreviewInfo(null);
+    setDraggingBarInfo(null);
+    const { start, end } = previewInfo;
+
+    if (type === 'shift') {
+      const targetPerson = orderedStaff[rowIndex];
+      const srcId = orderedStaff[staffIndex].id;
+      const tgtId = targetPerson.id;
+      const capturedShiftIndex = shiftIndex;
+      const doTransfer = () => {
+        setOrderedStaff(prev => {
+          const next = [...prev];
+          const si = prev.findIndex(s => s.id === srcId);
+          const ti = prev.findIndex(s => s.id === tgtId);
+          if (si === -1 || ti === -1) return prev;
+          const src = { ...next[si] };
+          src.shifts    = src.shifts.filter((_, j) => j !== capturedShiftIndex);
+          src.scheduled = src.shifts.length > 0;
+          next[si] = src;
+          const tgt = { ...next[ti] };
+          tgt.shifts    = [...tgt.shifts, { id: `s${Date.now()}`, start, end }];
+          tgt.scheduled = true;
+          next[ti] = tgt;
+          return next;
+        });
+      };
+      doTransfer();
+
+    } else if (type === 'desk') {
+      const doMove = () => setOrderedStaff(prev => {
+        const next = [...prev];
+        const src = { ...next[staffIndex] };
+        src.deskShifts = src.deskShifts.filter((_, j) => j !== deskIndex);
+        next[staffIndex] = src;
+        const tgt = { ...next[rowIndex] };
+        tgt.deskShifts = [...tgt.deskShifts, { id: `d${Date.now()}`, start, end }];
+        next[rowIndex] = tgt;
+        return next;
+      });
+      const conflict = orderedStaff.find((s, i) =>
+        i !== rowIndex && i !== staffIndex && s.deskShifts?.some(d => start < d.end && end > d.start)
+      );
+      if (conflict) {
+        setPendingWarning({
+          title: 'Desk Conflict',
+          message: `${conflict.name} is already on desk ${formatTime(start)}–${formatTime(end)}. Move anyway?`,
+          confirmLabel: 'Move Anyway',
+          onConfirm: () => { doMove(); setPendingWarning(null); },
+          onCancel:  () => setPendingWarning(null),
+        });
+      } else {
+        doMove();
+      }
+
+    } else if (type === 'vr') {
+      const doMove = () => setOrderedStaff(prev => {
+        const next = [...prev];
+        const src = { ...next[staffIndex] };
+        src.vrShifts = src.vrShifts.filter((_, j) => j !== vrIndex);
+        next[staffIndex] = src;
+        const tgt = { ...next[rowIndex] };
+        tgt.vrShifts = [...tgt.vrShifts, { id: `v${Date.now()}`, start, end }];
+        next[rowIndex] = tgt;
+        return next;
+      });
+      const conflict = orderedStaff.find((s, i) =>
+        i !== rowIndex && i !== staffIndex && s.vrShifts?.some(v => start < v.end && end > v.start)
+      );
+      if (conflict) {
+        setPendingWarning({
+          title: 'VR Conflict',
+          message: `${conflict.name} is already on VR ${formatTime(start)}–${formatTime(end)}. Move anyway?`,
+          confirmLabel: 'Move Anyway',
+          onConfirm: () => { doMove(); setPendingWarning(null); },
+          onCancel:  () => setPendingWarning(null),
+        });
+      } else {
+        doMove();
+      }
+
+    } else if (type === 'oneOnOne') {
+      // Straight move, with no cross-person conflict prompt: a 1-1 is not a post
+      // only one person can hold, so another row having one at the same time is
+      // normal rather than something to confirm. The two text fields move with it.
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const src = { ...next[staffIndex] };
+        const moved = src.oneOnOnes[oneOnOneIndex];
+        src.oneOnOnes = src.oneOnOnes.filter((_, j) => j !== oneOnOneIndex);
+        next[staffIndex] = src;
+        const tgt = { ...next[rowIndex] };
+        tgt.oneOnOnes = [...(tgt.oneOnOnes ?? []), { ...moved, id: `o${Date.now()}`, start, end }];
+        next[rowIndex] = tgt;
+        return next;
+      });
+
+    } else if (type === 'event') {
+      assignEventWithShiftCheck(eventId, rowIndex, { alsoUnassignStaffId: staffId });
+    }
+  }
+
+  // ── Event assignment with shift-coverage check ────────────────────────────────
+  function assignEventWithShiftCheck(eventId, targetStaffIndex, { alsoUnassignStaffId = null } = {}) {
+    const evt    = todayEvents.find(ev => ev.id === eventId);
+    const person = orderedStaff[targetStaffIndex];
+    if (!evt || !person) return;
+
+    const isCovered = person.shifts.some(s => s.start <= evt.start && s.end >= evt.end);
+    const personId  = person.id;
+
+    const doAssign = () => {
+      if (alsoUnassignStaffId) schedule.unassignStaffFromEvent(eventId, alsoUnassignStaffId);
+      schedule.assignStaffToEvent(eventId, personId);
+
+      if (!isCovered) {
+        setOrderedStaff(prev => {
+          const pIdx = prev.findIndex(s => s.id === personId);
+          if (pIdx === -1) return prev;
+          const next = [...prev];
+          const p    = { ...next[pIdx] };
+          const hostIdx = p.shifts.findIndex(s => s.start <= evt.end && s.end >= evt.start);
+          if (hostIdx !== -1) {
+            p.shifts = [...p.shifts];
+            p.shifts[hostIdx] = {
+              ...p.shifts[hostIdx],
+              start: Math.min(p.shifts[hostIdx].start, evt.start),
+              end:   Math.max(p.shifts[hostIdx].end,   evt.end),
+            };
+          } else {
+            p.shifts    = [...p.shifts, { id: `s${Date.now()}`, start: evt.start, end: evt.end }];
+            p.scheduled = true;
+          }
+          next[pIdx] = p;
+          return next;
+        });
+      }
+    };
+
+    if (!isCovered) {
+      const hasPartialShift = person.shifts.some(s => s.start <= evt.end && s.end >= evt.start);
+      setPendingWarning({
+        title:        hasPartialShift ? 'Shift Doesn\'t Cover Event' : 'No Shift During Event',
+        message:      hasPartialShift
+          ? <><strong style={{ color: 'var(--color-text)' }}>{person.name}</strong>'s shift doesn't fully cover <em>{evt.name}</em> ({formatTime(evt.start)}–{formatTime(evt.end)}). Their shift will be extended to cover it.</>
+          : <><strong style={{ color: 'var(--color-text)' }}>{person.name}</strong> has no shift during <em>{evt.name}</em> ({formatTime(evt.start)}–{formatTime(evt.end)}). A new shift will be created.</>,
+        confirmLabel: hasPartialShift ? 'Assign & Extend Shift' : 'Assign & Create Shift',
+        onConfirm: () => { doAssign(); setPendingWarning(null); },
+        onCancel:  () => setPendingWarning(null),
+      });
+    } else {
+      doAssign();
+    }
+  }
+
+  // ── Timeline drop (toolbar chips) ────────────────────────────────────────────
+  function handleTimelineDrop(staffIndex) {
+    if (activeDragType === 'shift') {
+      const p = orderedStaff[staffIndex];
+      // Use preview cursor position if valid; fall back to first free slot
+      let newStart, newEnd;
+      if (previewInfo?.staffIndex === staffIndex && previewInfo.valid) {
+        newStart = previewInfo.start;
+        newEnd   = previewInfo.end;
+      } else {
+        newStart = firstFreeSlot(p.shifts, 2);
+        if (newStart === null) { endDrag(); return; }
+        newEnd = newStart + 2;
+      }
+      const doPlace = () => {
+        setOrderedStaff(prev => {
+          const next = [...prev];
+          const pp = { ...next[staffIndex] };
+          pp.scheduled = true;
+          pp.shifts = [...pp.shifts, { id: `s${Date.now()}`, start: newStart, end: newEnd }];
+          next[staffIndex] = pp;
+          return sortByShift(next);
+        });
+      };
+      doPlace();
+    } else if (activeDragType === 'desk') {
+      const p = orderedStaff[staffIndex];
+      const personEvents = todayEvents.filter(ev => ev.assignedStaff.includes(p.id));
+      let newStart = null;
+      if (previewInfo?.staffIndex === staffIndex && previewInfo.valid && previewInfo.start !== null) {
+        newStart = previewInfo.start;
+      } else {
+        // 1-1s join the avoid list so an auto-placed desk turn doesn't land on one.
+        const avoid = [...personEvents, ...(p.oneOnOnes ?? []), ...vrOf(p)];
+        for (const shift of p.shifts) {
+          const slot = firstFreeSlot(p.deskShifts, 1, shift.start, shift.end, avoid);
+          if (slot !== null) { newStart = slot; break; }
+        }
+      }
+      if (newStart !== null) {
+        const newEnd = newStart + 1;
+        const doPlace = () => setOrderedStaff(prev => {
+          const next = [...prev];
+          const pp = { ...next[staffIndex] };
+          pp.deskShifts = [...pp.deskShifts, { id: `d${Date.now()}`, start: newStart, end: newEnd }];
+          next[staffIndex] = pp;
+          return next;
+        });
+        const conflict = orderedStaff.find((s, i) =>
+          i !== staffIndex && s.deskShifts?.some(d => newStart < d.end && newEnd > d.start)
+        );
+        if (conflict) {
+          endDrag();
+          setPendingWarning({
+            title: 'Desk Conflict',
+            message: `${conflict.name} is already on desk ${formatTime(newStart)}–${formatTime(newEnd)}. Place anyway?`,
+            confirmLabel: 'Place Anyway',
+            onConfirm: () => { doPlace(); setPendingWarning(null); },
+            onCancel:  () => setPendingWarning(null),
+          });
+          return;
+        }
+        doPlace();
+      }
+    } else if (activeDragType === 'vr') {
+      const p = orderedStaff[staffIndex];
+      const personEvents = todayEvents.filter(ev => ev.assignedStaff.includes(p.id));
+      let newStart = null;
+      if (previewInfo?.staffIndex === staffIndex && previewInfo.valid && previewInfo.start !== null) {
+        newStart = previewInfo.start;
+      } else {
+        // Desk turns and 1-1s are passed as things to avoid, so an auto-placed VR
+        // turn never lands on top of one.
+        const avoid = [...personEvents, ...(p.deskShifts ?? []), ...(p.oneOnOnes ?? [])];
+        for (const shift of p.shifts) {
+          const slot = firstFreeSlot(p.vrShifts, 1, shift.start, shift.end, avoid);
+          if (slot !== null) { newStart = slot; break; }
+        }
+      }
+      if (newStart !== null) {
+        const newEnd = newStart + 1;
+        const doPlace = () => setOrderedStaff(prev => {
+          const next = [...prev];
+          const pp = { ...next[staffIndex] };
+          pp.vrShifts = [...pp.vrShifts, { id: `v${Date.now()}`, start: newStart, end: newEnd }];
+          next[staffIndex] = pp;
+          return next;
+        });
+        const conflict = orderedStaff.find((s, i) =>
+          i !== staffIndex && s.vrShifts?.some(v => newStart < v.end && newEnd > v.start)
+        );
+        if (conflict) {
+          endDrag();
+          setPendingWarning({
+            title: 'VR Conflict',
+            message: `${conflict.name} is already on VR ${formatTime(newStart)}–${formatTime(newEnd)}. Place anyway?`,
+            confirmLabel: 'Place Anyway',
+            onConfirm: () => { doPlace(); setPendingWarning(null); },
+            onCancel:  () => setPendingWarning(null),
+          });
+          return;
+        }
+        doPlace();
+      }
+    } else if (activeDragType === 'oneOnOne') {
+      const p = orderedStaff[staffIndex];
+      const personEvents = todayEvents.filter(ev => ev.assignedStaff.includes(p.id));
+      let newStart = null;
+      if (previewInfo?.staffIndex === staffIndex && previewInfo.valid && previewInfo.start !== null) {
+        newStart = previewInfo.start;
+      } else {
+        const avoid = [...personEvents, ...(p.deskShifts ?? []), ...vrOf(p)];
+        for (const shift of p.shifts) {
+          const slot = firstFreeSlot(p.oneOnOnes ?? [], 1, shift.start, shift.end, avoid);
+          if (slot !== null) { newStart = slot; break; }
+        }
+      }
+      // Nowhere inside a shift to put it — a row with no shift can't host a 1-1.
+      if (newStart === null) { endDrag(); return; }
+      const newEnd = newStart + 1;
+      // Index the new turn will land at, captured before the append so the edit
+      // modal opened below addresses the right one.
+      const newIndex = (p.oneOnOnes ?? []).length;
+      setOrderedStaff(prev => {
+        const next = [...prev];
+        const pp = { ...next[staffIndex] };
+        pp.oneOnOnes = [...(pp.oneOnOnes ?? []), { id: `o${Date.now()}`, start: newStart, end: newEnd, kind: '', withWhom: '' }];
+        next[staffIndex] = pp;
+        return next;
+      });
+      // A 1-1 is meaningless until it says what it is and who it's with, so the
+      // editor opens straight away rather than leaving an unlabelled bar behind.
+      setEditModal({ type: 'oneOnOne', staffIndex, oneOnOneIndex: newIndex });
+    } else if (activeDragType === 'event' && draggingEventId !== null) {
+
+      assignEventWithShiftCheck(draggingEventId, staffIndex);
+    }
+    endDrag();
+  }
+
+  const trashActive = trashHtmlOver;
+
+  async function doFinalize() {
+    // Never publish a placeholder (or the previous day's rows) over the real day.
+    if (!loadedRef.current) return;
+    const date = toDateStr(schedule.currentDate);
+    try {
+      const saved = await schedulesApi.saveDay(date, {
+        staff: staffForSave(), events: todayEvents, finalized: true,
+        expectedVersion: versionRef.current,
+      });
+      if (currentDateStrRef.current === date) {
+        versionRef.current = saved.version ?? versionRef.current + 1;
+        setStamp(editStampOf(saved));
+      }
+    } catch (err) {
+      handleSaveError(err);
+      if (isConflict(err)) return; // don't claim it's published when it isn't
+      console.warn('Schedule save failed — finalized locally only:', err.message);
+    }
+    // This save itself shouldn't be mistaken for the next edit by the auto-unfinalize watcher.
+    justLoadedRef.current = true;
+    setFinalized(true);
+  }
+
+  async function handleUnfinalize() {
+    if (!loadedRef.current) return;
+    setFinalized(false);
+    const date = toDateStr(schedule.currentDate);
+    try {
+      const saved = await schedulesApi.saveDay(date, {
+        staff: staffForSave(), events: todayEvents, finalized: false,
+        expectedVersion: versionRef.current,
+      });
+      if (currentDateStrRef.current === date) {
+        versionRef.current = saved.version ?? versionRef.current + 1;
+        setStamp(editStampOf(saved));
+      }
+    } catch (err) {
+      handleSaveError(err);
+      if (!isConflict(err)) console.warn('Schedule save failed — unfinalized locally only:', err.message);
+    }
+    justLoadedRef.current = true;
+  }
+
+  function handleFinalize() {
+    const alerts = buildAlerts(orderedStaff.filter(s => s.shifts?.length > 0), todayEvents, currentDow, { disabledDuties });
+    const issues = alerts.filter(a => a.type !== 'blue');
+    if (issues.length > 0) {
+      setFinalizeWarning(issues);
+      return;
+    }
+    doFinalize();
+  }
+
+  return (
+    <div>
+      {/* Editing this day elsewhere means this copy is stale and nothing further
+          will save. Deliberately loud and persistent rather than a toast: every
+          subsequent edit is also being discarded, so the manager needs to stop. */}
+      {conflict && (
+        <div
+          className="flex items-center justify-between gap-4 p-4 rounded-xl mb-4 border"
+          style={{ background: 'rgba(200,64,64,0.12)', borderColor: 'var(--color-red)' }}
+        >
+          <div>
+            <p className="text-sm font-semibold" style={{ color: '#f07070' }}>
+              {conflict.by
+                ? `This day was changed by ${conflict.by}${conflict.at ? ` at ${formatEditTime(conflict.at)}` : ''}`
+                : 'This day was changed somewhere else'}
+            </p>
+            <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-dim)' }}>
+              Your edits since then aren&apos;t being saved. Reload to pick up the newer version —
+              anything you changed here will be lost.
+            </p>
+          </div>
+          <button
+            onClick={() => window.location.reload()}
+            className="text-sm px-4 py-2 rounded-lg cursor-pointer hover:opacity-80 transition-opacity shrink-0"
+            style={{ background: 'var(--color-red)', color: 'white', border: 'none' }}
+          >
+            Reload day
+          </button>
+        </div>
+      )}
+
+      <StatsHeader
+        staff={orderedStaff} events={todayEvents} currentDate={schedule.currentDate}
+        onPrev={handlePrevDay} onNext={handleNextDay}
+        finalized={finalized} onFinalize={handleFinalize} onUnfinalize={handleUnfinalize}
+        onApplyTemplate={() => setApplyTplOpen(true)}
+        onSaveAsTemplate={() => setSaveTplOpen(true)}
+        stampText={describeEditStamp(stamp, finalized)}
+        onClearDay={() => {
+          // Saves through the normal auto-save, so it's version-checked like any edit.
+          const { staff: cleared, clearEventIds } = clearDaySchedule(orderedStaff, todayEvents);
+          setOrderedStaff(sortByShift(cleared));
+          clearEventIds.forEach(id => schedule.updateEvent(id, { assignedStaff: [] }));
+        }}
+      />
+      {(() => {
+        // Hold the alert inputs steady while a drag/resize is in progress so the
+        // strip only updates once the gesture ends (avoids mid-drag layout shift).
+        const draggingNow = !!(activeBar || draggingBarInfo || activeDragType);
+        if (!draggingNow) {
+          alertsStaffRef.current  = orderedStaff.filter(s => s.shifts?.length > 0);
+          alertsEventsRef.current = todayEvents;
+        }
+        return <AlertsBar staff={alertsStaffRef.current} events={alertsEventsRef.current} dow={currentDow} />;
+      })()}
+
+      {/* Toolbar */}
+      {!finalized && (
+        <div className="flex items-start justify-between gap-4 mb-4 px-1">
+          <div className="flex items-center gap-2 flex-wrap flex-1">
+            <DragChip
+              label="New Shift" isActive={activeDragType === 'shift'}
+              color="var(--color-green)" borderColor="#2a4a38" bg="rgba(74,124,94,0.15)"
+              icon={<div style={{ width: 14, height: 10, borderRadius: 2, background: 'currentColor', opacity: 0.8 }} />}
+              onDragStart={e => { e.dataTransfer.effectAllowed = 'copy'; setActiveDragType('shift'); }}
+              onDragEnd={endDrag}
+            />
+            <DragChip
+              label="New Desk Shift" isActive={activeDragType === 'desk'}
+              color="var(--color-bar-desk-dot)" borderColor="var(--color-bar-desk)" bg="var(--color-bar-desk-fill)"
+              icon={<div style={{ width: 14, height: 10, borderRadius: 2, border: '1.5px solid currentColor' }} />}
+              onDragStart={e => { e.dataTransfer.effectAllowed = 'copy'; setActiveDragType('desk'); }}
+              onDragEnd={endDrag}
+            />
+            {vrEnabled && (
+              <DragChip
+                label="New VR Shift" isActive={activeDragType === 'vr'}
+                color="var(--color-bar-vr-dot)" borderColor="var(--color-bar-vr)" bg="var(--color-bar-vr-fill)"
+                icon={<div style={{ width: 14, height: 10, borderRadius: 2, border: '1.5px solid currentColor' }} />}
+                onDragStart={e => { e.dataTransfer.effectAllowed = 'copy'; setActiveDragType('vr'); }}
+                onDragEnd={endDrag}
+              />
+            )}
+            <DragChip
+              label="New 1-1" isActive={activeDragType === 'oneOnOne'}
+              color="var(--color-bar-oneone-dot)" borderColor="var(--color-bar-oneone)" bg="var(--color-bar-oneone-fill)"
+              icon={<div style={{ width: 14, height: 10, borderRadius: 2, border: '1.5px solid currentColor' }} />}
+              onDragStart={e => { e.dataTransfer.effectAllowed = 'copy'; setActiveDragType('oneOnOne'); }}
+              onDragEnd={endDrag}
+            />
+            {todayEvents.length > 0 && (
+              <div className="w-px self-stretch" style={{ background: 'var(--color-border)', margin: '0 2px' }} />
+            )}
+            {todayEvents.map(evt => (
+              <DragChip
+                key={evt.id} label={evt.name}
+                isActive={activeDragType === 'event' && draggingEventId === evt.id}
+                color="var(--color-bar-event-dot)" borderColor="var(--color-bar-event)" bg="var(--color-bar-event-fill)"
+                icon={<div style={{ width: 8, height: 8, borderRadius: '50%', background: 'currentColor' }} />}
+                onDragStart={e => { e.dataTransfer.effectAllowed = 'copy'; setActiveDragType('event'); setDraggingEventId(evt.id); }}
+                onDragEnd={endDrag}
+              />
+            ))}
+          </div>
+
+          {/* Trash zone */}
+          <div
+            ref={trashRef}
+            onDragOver={e => e.preventDefault()}
+            onDragEnter={() => setTrashHtmlOver(true)}
+            onDragLeave={e => { if (!trashRef.current?.contains(e.relatedTarget)) setTrashHtmlOver(false); }}
+            onDrop={() => {
+              setTrashHtmlOver(false);
+              // Bar drag → delete/unschedule
+              if (draggingBarInfo) {
+                const { type, staffIndex, shiftIndex, deskIndex, vrIndex, oneOnOneIndex, eventId } = draggingBarInfo;
+                if (type === 'shift') {
+                  // Deleting a shift also clears the desk time, VR time, 1-1s and
+                  // event assignments that were sitting on it — otherwise those
+                  // bars stay on the row even though the person is now
+                  // unscheduled. The extent captured at drag start is what's
+                  // compared against, not the bar's current position: dragging it
+                  // up here moved it (see removeShiftAndSweep).
+                  const person = orderedStaff[staffIndex];
+                  const { person: swept, events } = removeShiftAndSweep(
+                    person,
+                    shiftIndex,
+                    todayEvents.filter(ev => ev.assignedStaff.includes(person.id)),
+                    draggingBarInfo.originalStart != null
+                      ? { start: draggingBarInfo.originalStart, end: draggingBarInfo.originalEnd }
+                      : null,
+                  );
+                  setOrderedStaff(prev => {
+                    const next = [...prev];
+                    next[staffIndex] = swept;
+                    return sortByShift(next);
+                  });
+                  events.forEach(ev => schedule.unassignStaffFromEvent(ev.id, person.id));
+                } else if (type === 'desk') {
+                  setOrderedStaff(prev => {
+                    const next = [...prev];
+                    const p = { ...next[staffIndex] };
+                    p.deskShifts = p.deskShifts.filter((_, j) => j !== deskIndex);
+                    next[staffIndex] = p;
+                    return next;
+                  });
+                } else if (type === 'vr') {
+                  setOrderedStaff(prev => {
+                    const next = [...prev];
+                    const p = { ...next[staffIndex] };
+                    p.vrShifts = p.vrShifts.filter((_, j) => j !== vrIndex);
+                    next[staffIndex] = p;
+                    return next;
+                  });
+                } else if (type === 'oneOnOne') {
+                  setOrderedStaff(prev => {
+                    const next = [...prev];
+                    const p = { ...next[staffIndex] };
+                    p.oneOnOnes = (p.oneOnOnes ?? []).filter((_, j) => j !== oneOnOneIndex);
+                    next[staffIndex] = p;
+                    return next;
+                  });
+                } else if (type === 'event') {
+                  schedule.unassignStaffFromEvent(eventId, draggingBarInfo.staffId);
+                }
+                setDraggingBarInfo(null);
+              }
+              endDrag();
+            }}
+            className="flex items-center gap-2 px-4 py-2 rounded-lg border text-sm font-medium shrink-0 transition-all"
+            style={{
+              borderColor: trashActive ? 'var(--color-red)' : 'var(--color-border)',
+              color:        trashActive ? '#f07070' : 'var(--color-text-dim)',
+              background:   trashActive ? 'rgba(200,64,64,0.12)' : 'transparent',
+            }}
+          >
+            <DeleteIcon size={15} />
+            Drop here to remove
+          </div>
+        </div>
+      )}
+
+      <ScheduleGrid
+        staff={orderedStaff} events={todayEvents} finalized={finalized}
+        onBarMouseDown={handleBarMouseDown}
+        onDeskBarMouseDown={handleDeskBarMouseDown}
+        onVrBarMouseDown={handleVrBarMouseDown}
+        onOneOnOneBarMouseDown={handleOneOnOneBarMouseDown}
+        onEventBarMouseDown={handleEventBarMouseDown}
+        activeBar={activeBar}
+        activeDragType={activeDragType} hoverRow={hoverRow}
+        onTimelineDragOver={handleTimelineDragOver} onTimelineDrop={handleTimelineDrop}
+        previewInfo={previewInfo}
+        draggingBarInfo={draggingBarInfo}
+        onShiftBarDragStart={handleShiftBarDragStart}
+        onDeskBarDragStart={handleDeskBarDragStart}
+        onVrBarDragStart={handleVrBarDragStart}
+        onOneOnOneBarDragStart={handleOneOnOneBarDragStart}
+        onEventBarDragStart={handleEventBarDragStart}
+        onBarDragEnd={handleBarDragEnd}
+        onBarDragOver={handleBarDragOver}
+        onBarDrop={handleBarDrop}
+        onBarContextMenu={handleBarContextMenu}
+        onNewShift={(staffIndex, hour) => setEditModal({ type: 'shift', staffIndex, isNew: true, ...newShiftAt(hour) })}
+        getPersonAvailability={id => getAvailability(id, currentDow)}
+      />
+
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x} y={contextMenu.y}
+          onEdit={handleContextMenuEdit}
+          onDelete={handleContextMenuDelete}
+          onClose={() => setContextMenu(null)}
+        />
+      )}
+      {editModal && (
+        <EditModal
+          target={editModal}
+          orderedStaff={orderedStaff}
+          allEvents={schedule.events}
+          onSave={handleEditSave}
+          onClose={() => setEditModal(null)}
+        />
+      )}
+      {applyTplOpen && (
+        <ApplyTemplateCalendarModal
+          templates={templates}
+          allStaff={schedule.staff}
+          saveDaySchedule={schedule.saveDaySchedule}
+          onClose={() => setApplyTplOpen(false)}
+          onApplyStaff={(newStaff, dateStr) => {
+            if (newStaff && dateStr === schedule.currentDate.toLocaleDateString('en-CA')) {
+              setOrderedStaff(sortByShift(newStaff));
+            }
+          }}
+        />
+      )}
+      {saveTplOpen && (
+        <SaveAsDayTemplateModal
+          currentDate={schedule.currentDate}
+          staff={orderedStaff}
+          onSave={addTemplate}
+          onClose={() => setSaveTplOpen(false)}
+        />
+      )}
+      {pendingWarning && (
+        <WarningModal
+          title={pendingWarning.title}
+          message={pendingWarning.message}
+          confirmLabel={pendingWarning.confirmLabel}
+          onConfirm={pendingWarning.onConfirm}
+          onCancel={pendingWarning.onCancel}
+        />
+      )}
+      {finalizeWarning && (
+        <WarningModal
+          title="Schedule Has Issues"
+          message={
+            <div>
+              <p style={{ marginBottom: 8 }}>The following issues were found:</p>
+              <ul style={{ listStyle: 'none', padding: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {finalizeWarning.map((a, i) => (
+                  <li key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, fontSize: 12 }}>
+                    <span style={{ width: 8, height: 8, borderRadius: '50%', background: a.type === 'understaffed' ? 'var(--color-green)' : a.type === 'event' ? 'var(--color-bar-event-dot)' : a.type === 'vr' ? 'var(--color-bar-vr-dot)' : a.type === 'oneOnOne' ? 'var(--color-bar-oneone-dot)' : 'var(--color-bar-desk-dot)', flexShrink: 0, marginTop: 3 }} />
+                    <span style={{ color: 'var(--color-text-dim)' }}>{a.text}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          }
+          confirmLabel="Finalize Anyway"
+          onConfirm={() => { setFinalizeWarning(null); doFinalize(); }}
+          onCancel={() => setFinalizeWarning(null)}
+        />
+      )}
+    </div>
+  );
+}

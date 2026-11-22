@@ -1,0 +1,123 @@
+import { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
+import { templatesApi } from '../utils/api';
+
+const TemplatesContext = createContext(null);
+
+/**
+ * A name that doesn't collide with an existing template.
+ *
+ * Free name        → returned unchanged.
+ * Taken            → " (n)" appended, using the lowest free n.
+ * Already numbered → the suffix is replaced rather than stacked, so copying
+ *                    "Fall (1)" yields "Fall (2)", not "Fall (1) (1)".
+ * Blank            → left blank; the editor creates unnamed drafts and names
+ *                    them on save.
+ */
+function uniqueTemplateName(desired, templates) {
+  const wanted = String(desired ?? '').trim();
+  if (!wanted) return wanted;
+
+  const taken = new Set((templates ?? []).map(t => String(t?.name ?? '').trim().toLowerCase()));
+  if (!taken.has(wanted.toLowerCase())) return wanted;
+
+  const base = wanted.replace(/\s*\(\d+\)$/, '').trim() || wanted;
+  let n = 1;
+  while (taken.has(`${base} (${n})`.toLowerCase())) n += 1;
+  return `${base} (${n})`;
+}
+
+export function TemplatesProvider({ children }) {
+  const [templates,  setTemplates]  = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+
+  // The template editor holds its edits in memory until Save, so switching the
+  // selection out from under it destroys work. It registers a guard here; the
+  // guard returns false to refuse a selection change and take responsibility for
+  // it (by asking the manager what to do).
+  //
+  // Guarding the selection itself, rather than reacting after it has already
+  // moved, is what keeps the sidebar from briefly highlighting a template the
+  // editor hasn't opened.
+  const selectGuardRef = useRef(null);
+  const registerSelectGuard = useCallback(fn => {
+    selectGuardRef.current = fn;
+    return () => { if (selectGuardRef.current === fn) selectGuardRef.current = null; };
+  }, []);
+
+  const requestSelect = useCallback(id => {
+    if (selectGuardRef.current && selectGuardRef.current(id) === false) return;
+    setSelectedId(id);
+  }, []);
+
+  // Templates live in the database. This used to seed from a localStorage cache,
+  // but nothing had written that key since templates moved server-side — so the
+  // seed could only ever return an empty list, or worse, briefly resurrect stale
+  // templates left in a browser from an older build.
+  useEffect(() => {
+    templatesApi.getAll()
+      .then(data => setTemplates(data))
+      .catch(() => { /* backend not running — leave the list empty */ });
+  }, []);
+
+  // Live copy of the list so addTemplate can read it without depending on
+  // `templates` — its identity has to stay stable, since consumers pass it
+  // through their own useCallback dependency arrays.
+  const templatesRef = useRef(templates);
+  useEffect(() => { templatesRef.current = templates; }, [templates]);
+
+  // Creating a template whose name is taken numbers the copy rather than
+  // failing — "Fall Schedule" → "Fall Schedule (1)". This lives inside
+  // addTemplate so every creation path gets it and none can forget.
+  // (Renaming an existing template still rejects duplicates — silently
+  // renaming something the user just typed would be surprising.)
+  const addTemplate = useCallback(async (tpl) => {
+    const created = await templatesApi.create({
+      ...tpl,
+      name: uniqueTemplateName(tpl?.name, templatesRef.current),
+    });
+    setTemplates(prev => [...prev, created]);
+    return created;
+  }, []);
+
+  // Carries the version this edit was based on, so a save cannot land on top of
+  // somebody else's. A template save replaces the whole record — the editor
+  // sends the entire `days` map — so a lost update costs a week's layout, not a
+  // field.
+  //
+  // Safe to send here because this call is awaited and the result replaces the
+  // local copy, so the version we hold is always the one the server last
+  // confirmed. A fire-and-forget caller must not do this: it would send a stale
+  // version after its own in-flight write and conflict with itself.
+  const updateTemplate = useCallback(async (id, changes) => {
+    const known = templatesRef.current.find(t => t.id === id);
+    const updated = await templatesApi.update(id, {
+      ...changes,
+      expectedVersion: known?.version ?? 0,
+    });
+    setTemplates(prev => prev.map(t => t.id === id ? updated : t));
+    return updated;
+  }, []);
+
+  const removeTemplate = useCallback(async (id) => {
+    await templatesApi.remove(id);
+    setTemplates(prev => prev.filter(t => t.id !== id));
+  }, []);
+
+  const removeAllTemplates = useCallback(async () => {
+    await templatesApi.removeAll();
+    setTemplates([]);
+  }, []);
+
+  return (
+    <TemplatesContext.Provider value={{
+      templates, selectedId, setSelectedId, requestSelect, registerSelectGuard,
+      addTemplate, updateTemplate, removeTemplate, removeAllTemplates,
+    }}>
+      {children}
+    </TemplatesContext.Provider>
+  );
+}
+
+export function useTemplates() {
+  return useContext(TemplatesContext);
+}

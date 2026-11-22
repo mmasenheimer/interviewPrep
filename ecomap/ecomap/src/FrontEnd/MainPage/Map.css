@@ -1,0 +1,60 @@
+/* Container Spacing */
+#map {
+    padding: 20px;
+}
+
+/* Form Layout */
+.form-group {
+    margin-bottom: 18px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 600;
+    color: #2d5a27;
+}
+
+.form-group input {
+    width: 320px;
+    max-width: 100%;
+    padding: 12px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 1rem;
+    box-sizing: border-box;
+}
+
+/* THE BUTTONS */
+.map-button {
+    display: inline-block;
+    padding: 12px 24px;
+    background-color: #2d5a27; /* Dark Green */
+    color: white;
+    font-size: 1rem;
+    font-weight: 600;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    margin-top: 10px;
+}
+
+.map-button:hover {
+    background-color: #1e3d1a; /* Darker Green */
+    transform: translateY(-1px);
+    box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+}
+
+.map-button:active {
+    transform: translateY(0);
+}
+
+/* Route Display Styling */
+.route-container {
+    border: 1px solid #ddd;
+    padding: 20px;
+    margin-bottom: 20px;
+    border-radius: 8px;
+    background-color: white;
+}
